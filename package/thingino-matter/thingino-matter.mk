@@ -33,6 +33,8 @@ define THINGINO_MATTER_INSTALL_TARGET_CMDS
 		$(TARGET_DIR)/usr/sbin/matter-event
 	$(INSTALL) -D -m 0755 $(@D)/S94matter \
 		$(TARGET_DIR)/etc/init.d/S94matter
+	$(INSTALL) -D -m 0755 $(@D)/S96matter_discovery \
+		$(TARGET_DIR)/etc/init.d/S96matter_discovery
 
 	# Web UI plugin
 	$(INSTALL) -D -m 0644 $(THINGINO_MATTER_PKGDIR)/files/matter.webui.json \

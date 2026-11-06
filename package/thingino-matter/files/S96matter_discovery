@@ -1,0 +1,100 @@
+#!/bin/sh
+# shellcheck disable=SC2018,SC2019,SC2034,SC2046,SC2068,SC2086,SC2231,SC3043
+# S96matter_discovery - Streamer profile configuration & discovery helper for Matter 1.5
+# Follows the same pattern as S96onvif_discovery
+
+MATTER_CONFIG=/etc/thingino.json
+PORTAL_MODE_FLAG="/run/portal_mode"
+
+raptor_conf_get() {
+	section="$1"
+	key="$2"
+	raptorctl config get "$section" "$key" 2>/dev/null
+}
+
+raptor_bool_default() {
+	section="$1"
+	key="$2"
+	default="$3"
+	val=$(raptor_conf_get "$section" "$key" | tr 'A-Z' 'a-z')
+	[ -n "$val" ] || val="$default"
+	case "$val" in
+		true | yes | 1 | on) echo "true" ;;
+		false | no | 0 | off) echo "false" ;;
+		*) echo "$default" ;;
+	esac
+}
+
+raptor_webrtc_port() {
+	port=$(raptor_conf_get webrtc http_port)
+	[ -n "$port" ] || port="8554"
+	echo "$port"
+}
+
+get_device_mac() {
+	mac=""
+	for iface in wlan0 eth0 ra0; do
+		if [ -f "/sys/class/net/$iface/address" ]; then
+			mac=$(cat "/sys/class/net/$iface/address" | tr -d ': \n')
+			break
+		fi
+	done
+	echo "${mac:-001122334455}"
+}
+
+start() {
+	echo -c 15 "Configuring Matter streamer profile"
+
+	if [ -f "$PORTAL_MODE_FLAG" ]; then
+		exit 0
+	fi
+
+	if [ "$(jct $MATTER_CONFIG get matter.enabled 2>/dev/null)" != "true" ]; then
+		exit 0
+	fi
+
+	mac=$(get_device_mac)
+	last4=$(printf '%s' "$mac" | tail -c 4)
+	disc_base=$((0x$last4 % 4096))
+	[ "$disc_base" -eq 0 ] && disc_base=3840
+
+	current_disc=$(jct $MATTER_CONFIG get matter.discriminator 2>/dev/null)
+	if [ -z "$current_disc" ] || [ "$current_disc" = "3840" ]; then
+		jct $MATTER_CONFIG set matter.discriminator "$disc_base"
+	fi
+
+	# Detect streamer backend and store in config
+	if [ -x /var/www/x/webrtc-whip.cgi ]; then
+		jct $MATTER_CONFIG set matter.streamer_backend "raptor"
+	elif [ -f /etc/timps.conf ]; then
+		jct $MATTER_CONFIG set matter.streamer_backend "timps"
+	fi
+
+	# Notify matterd to refresh its mDNS advertisement
+	if [ -x /usr/sbin/matterctl ]; then
+		/usr/sbin/matterctl announce >/dev/null 2>&1 || true
+	fi
+}
+
+stop() {
+	:
+}
+
+case "$1" in
+	start)
+		start
+		;;
+	stop)
+		stop
+		;;
+	restart)
+		stop
+		start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+		;;
+esac
+
+exit 0
