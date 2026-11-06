@@ -1,9 +1,9 @@
 config BR2_PACKAGE_THINGINO_MATTER
 	bool "thingino-matter"
 	default n
+	depends on BR2_PACKAGE_MBEDTLS || BR2_PACKAGE_THINGINO_MBEDTLS
 	depends on BR2_PACKAGE_THINGINO_JCT
 	depends on BR2_PACKAGE_THINGINO_AGENT
-	select BR2_PACKAGE_MBEDTLS if !BR2_PACKAGE_THINGINO_MBEDTLS && !BR2_PACKAGE_WOLFSSL
 	help
 	  Matter 1.5 camera service for Thingino firmware.
 	  Provides a lightweight pure C daemon (matterd) exposing the onboard
@@ -13,3 +13,6 @@ config BR2_PACKAGE_THINGINO_MATTER
 	  Supports Raptor and TIMPS streamer backends.
 
 	  https://github.com/themactep/thingino-firmware
+
+comment "thingino-matter needs mbedTLS"
+	depends on !BR2_PACKAGE_MBEDTLS && !BR2_PACKAGE_THINGINO_MBEDTLS

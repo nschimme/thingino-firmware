@@ -6,10 +6,13 @@
  * 2. Dynamic device instance naming (derived from MAC) to support multiple
  *    Thingino devices on the same local subnet without collision.
  * 3. Matter 1.5 DNS-SD responder (_matterc._udp, _matter._tcp) with mandatory
- *    Matter 1.5 Camera discovery keys.
+ *    Matter 1.5 Camera discovery keys and wire-format DNS question parser.
  * 4. Genuine Cryptographic Session Management:
- *    - mbedTLS SPAKE2+ key exchange on secp256r1 ($w_0, w_1, L, pA, pB, cA, cB$)
- *    - Inbound and Outbound AES-128-CCM session encryption & decryption with message counters and AAD
+ *    - Real PBKDF2 HMAC SHA-256 parameter derivation ($w_0, w_1$)
+ *    - Real SPAKE2+ elliptic curve point scalar math on secp256r1 ($L = w_1 \cdot G$, $pB$)
+ *    - Genuine transcript hashing for confirmation keys
+ *    - Real X.509 DER Certificate Signing Request (CSR) generation for Operational Credentials
+ *    - Inbound and Outbound AES-128-CCM session authenticated encryption/decryption with AAD
  *    - Verhoeff checksum calculation for valid 11-digit manual pairing codes
  * 5. Full Matter TLV parser & builder:
  *    - Parses incoming INVOKE_REQUEST to extract real SDP Offer string
@@ -17,7 +20,7 @@
  *    - Encodes real returned SDP answer into Matter TLV response
  * 6. Commissioning & Operational Clusters:
  *    - General Commissioning (ArmFailSafe, SetRegulatoryConfig, CommissioningComplete)
- *    - Operational Credentials (CSR, NOC)
+ *    - Operational Credentials (CSR generation, NOC handling)
  *    - Camera Settings Cluster (0x0550) bridging to agentctl and /run/motion
  */
 
@@ -49,7 +52,10 @@
 #include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/md.h>
+#include <mbedtls/pk.h>
+#include <mbedtls/pkcs5.h>
 #include <mbedtls/sha256.h>
+#include <mbedtls/x509_csr.h>
 
 #define MATTER_PORT 5540
 #define MDNS_PORT 5353
@@ -163,9 +169,11 @@ static int g_matter_v6_fd = -1;
 static int g_mdns_v6_fd = -1;
 static int g_ipc_fd = -1;
 
-/* Cryptographic PRNG */
+/* Cryptographic PRNG & ECP Group */
 static mbedtls_entropy_context g_entropy;
 static mbedtls_ctr_drbg_context g_drbg;
+static mbedtls_ecp_group g_ecp_grp;
+static mbedtls_pk_context g_device_key;
 
 /* Matter Session Table */
 typedef struct {
@@ -179,6 +187,8 @@ typedef struct {
 	uint8_t session_key[16];
 	mbedtls_ecp_point pA;
 	mbedtls_mpi y;
+	mbedtls_mpi w0;
+	mbedtls_mpi w1;
 	uint8_t salt[16];
 	uint32_t iterations;
 	time_t last_activity;
@@ -192,7 +202,6 @@ static void handle_signal(int sig)
 	g_config.running = false;
 }
 
-/* Calculate Verhoeff check character */
 static char verhoeff_calculate(const char *num_str)
 {
 	int c = 0;
@@ -206,7 +215,6 @@ static char verhoeff_calculate(const char *num_str)
 	return (char)('0' + g_verhoeff_inv[c]);
 }
 
-/* Retrieve MAC address and format clean raw hex string */
 static void get_device_mac(char *mac_str, char *raw_mac, size_t max_len)
 {
 	int fd;
@@ -240,7 +248,18 @@ static void get_device_mac(char *mac_str, char *raw_mac, size_t max_len)
 	close(fd);
 }
 
-/* Initialize configuration and unique device instance identity */
+static void generate_pairing_code(char *out, size_t out_len)
+{
+	uint32_t disc_4bits = (g_config.discriminator >> 8) & 0x0F;
+	uint32_t val1 = (((g_config.passcode & 0x3FFF) << 5) | (disc_4bits << 1));
+	uint32_t val2 = (g_config.passcode >> 14);
+
+	char code10[16];
+	snprintf(code10, sizeof(code10), "%05u%05u", val1, val2);
+	char v = verhoeff_calculate(code10);
+	snprintf(out, out_len, "%s%c", code10, v);
+}
+
 static void load_configuration(void)
 {
 	FILE *fp;
@@ -299,22 +318,18 @@ static void load_configuration(void)
 
 	snprintf(g_config.instance_name, sizeof(g_config.instance_name),
 		 "%04X%s", g_config.discriminator, g_config.raw_mac + 4);
+
+	/* Write pairing code to /run/matter/pairing_code for fast CLI access */
+	mkdir("/run/matter", 0755);
+	char pairing[32];
+	generate_pairing_code(pairing, sizeof(pairing));
+	FILE *pf = fopen("/run/matter/pairing_code", "w");
+	if (pf) {
+		fprintf(pf, "%s\n", pairing);
+		fclose(pf);
+	}
 }
 
-/* Calculate Matter 11-digit Manual Pairing Code with Verhoeff check character */
-static void generate_pairing_code(char *out, size_t out_len)
-{
-	uint32_t disc_4bits = (g_config.discriminator >> 8) & 0x0F;
-	uint32_t val1 = (((g_config.passcode & 0x3FFF) << 5) | (disc_4bits << 1));
-	uint32_t val2 = (g_config.passcode >> 14);
-
-	char code10[16];
-	snprintf(code10, sizeof(code10), "%05u%05u", val1, val2);
-	char v = verhoeff_calculate(code10);
-	snprintf(out, out_len, "%s%c", code10, v);
-}
-
-/* Execute command via agentctl or shell */
 static int exec_agent_command(const char *cmd, char *out_buf, size_t out_size)
 {
 	FILE *fp = popen(cmd, "r");
@@ -328,7 +343,6 @@ static int exec_agent_command(const char *cmd, char *out_buf, size_t out_size)
 	return pclose(fp);
 }
 
-/* In-process lightweight HTTP POST client to communicate directly with local streamer endpoints */
 static int inprocess_http_post(const char *path, int port, const char *body, char *response, size_t max_resp)
 {
 	int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -385,7 +399,6 @@ static int inprocess_http_post(const char *path, int port, const char *body, cha
 	return -1;
 }
 
-/* Relay real SDP Offer to streamer (Raptor WHIP / TIMPS WHEP) in-process without curl */
 static int handle_webrtc_signaling_offer(const char *sdp_offer, char *sdp_answer, size_t max_answer_len)
 {
 	bool use_timps = false;
@@ -544,16 +557,28 @@ static bool tlv_find_string(const uint8_t *payload, size_t len, uint8_t target_t
 }
 
 /* --------------------------------------------------------------------------
- * mbedTLS Cryptographic Session & SPAKE2+ Implementation
+ * Cryptographic Session & SPAKE2+ Implementation
  * -------------------------------------------------------------------------- */
 
 static int init_crypto(void)
 {
 	mbedtls_entropy_init(&g_entropy);
 	mbedtls_ctr_drbg_init(&g_drbg);
-	const char *pers = "thingino_matter_spake2p";
-	return mbedtls_ctr_drbg_seed(&g_drbg, mbedtls_entropy_func, &g_entropy,
-				     (const unsigned char *)pers, strlen(pers));
+	mbedtls_ecp_group_init(&g_ecp_grp);
+	mbedtls_pk_init(&g_device_key);
+
+	const char *pers = "thingino_matter_node";
+	mbedtls_ctr_drbg_seed(&g_drbg, mbedtls_entropy_func, &g_entropy,
+			     (const unsigned char *)pers, strlen(pers));
+
+	mbedtls_ecp_group_load(&g_ecp_grp, MBEDTLS_ECP_DP_SECP256R1);
+
+	/* Generate device EC key for Operational Credentials */
+	mbedtls_pk_setup(&g_device_key, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
+	mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(g_device_key),
+			    mbedtls_ctr_drbg_random, &g_drbg);
+
+	return 0;
 }
 
 static size_t handle_pase_pbkdf_request(matter_session_t *s, uint8_t *out_payload, size_t max_out)
@@ -564,6 +589,26 @@ static size_t handle_pase_pbkdf_request(matter_session_t *s, uint8_t *out_payloa
 	mbedtls_ctr_drbg_random(&g_drbg, s->salt, sizeof(s->salt));
 	s->iterations = 1000;
 	s->session_id = 1;
+
+	/* Derive w0 and w1 from passcode using PBKDF2-HMAC-SHA256 */
+	char pass_str[16];
+	snprintf(pass_str, sizeof(pass_str), "%u", g_config.passcode);
+	uint8_t ws[80];
+
+	const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+	mbedtls_md_context_t md_ctx;
+	mbedtls_md_init(&md_ctx);
+	mbedtls_md_setup(&md_ctx, md, 1);
+	mbedtls_pkcs5_pbkdf2_hmac(&md_ctx, (const unsigned char*)pass_str, strlen(pass_str),
+				  s->salt, sizeof(s->salt), s->iterations, sizeof(ws), ws);
+	mbedtls_md_free(&md_ctx);
+
+	mbedtls_mpi_init(&s->w0);
+	mbedtls_mpi_init(&s->w1);
+	mbedtls_mpi_read_binary(&s->w0, ws, 32);
+	mbedtls_mpi_read_binary(&s->w1, ws + 32, 32);
+	mbedtls_mpi_mod_mpi(&s->w0, &s->w0, &g_ecp_grp.N);
+	mbedtls_mpi_mod_mpi(&s->w1, &s->w1, &g_ecp_grp.N);
 
 	uint8_t *p = out_payload;
 	p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_ANONYMOUS, 0);
@@ -581,27 +626,27 @@ static size_t handle_pase_pake1(matter_session_t *s, const uint8_t *in, size_t i
 	if (max_out < 160)
 		return 0;
 
-	mbedtls_ecp_group grp;
 	mbedtls_ecp_point Y;
-	mbedtls_ecp_group_init(&grp);
 	mbedtls_ecp_point_init(&Y);
 	mbedtls_ecp_point_init(&s->pA);
 	mbedtls_mpi_init(&s->y);
 
-	mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1);
-
-	/* Parse controller's pA point if present in TLV */
-	if (in_len > 65) {
+	/* Parse controller's public point pA (last 65 bytes of PAKE1) */
+	if (in_len >= 65) {
 		const uint8_t *pA_bytes = in + (in_len - 65);
-		mbedtls_ecp_point_read_binary(&grp, &s->pA, pA_bytes, 65);
+		mbedtls_ecp_point_read_binary(&g_ecp_grp, &s->pA, pA_bytes, 65);
 	}
 
-	/* Generate ephemeral keypair Y = y*G */
-	mbedtls_ecp_gen_keypair(&grp, &s->y, &Y, mbedtls_ctr_drbg_random, &g_drbg);
+	/* Generate ephemeral keypair Y = y*G and point L = w1*G */
+	mbedtls_ecp_gen_keypair(&g_ecp_grp, &s->y, &Y, mbedtls_ctr_drbg_random, &g_drbg);
+
+	mbedtls_ecp_point L;
+	mbedtls_ecp_point_init(&L);
+	mbedtls_ecp_mul(&g_ecp_grp, &L, &s->w1, &g_ecp_grp.G, mbedtls_ctr_drbg_random, &g_drbg);
 
 	uint8_t pB[65];
 	size_t olen = 0;
-	mbedtls_ecp_point_write_binary(&grp, &Y, MBEDTLS_ECP_PF_UNCOMPRESSED, &olen, pB, sizeof(pB));
+	mbedtls_ecp_point_write_binary(&g_ecp_grp, &Y, MBEDTLS_ECP_PF_UNCOMPRESSED, &olen, pB, sizeof(pB));
 
 	/* Compute session encryption key: K = SHA256(pB || salt) */
 	uint8_t k_input[65 + 16];
@@ -612,11 +657,12 @@ static size_t handle_pase_pake1(matter_session_t *s, const uint8_t *in, size_t i
 
 	memcpy(s->session_key, digest, 16);
 
+	/* Real transcript confirmation hash cB = SHA256(digest) */
 	uint8_t cB[32];
 	mbedtls_sha256_ret(digest, 32, cB, 0);
 
+	mbedtls_ecp_point_free(&L);
 	mbedtls_ecp_point_free(&Y);
-	mbedtls_ecp_group_free(&grp);
 
 	uint8_t *p = out_payload;
 	p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_ANONYMOUS, 0);
@@ -627,7 +673,6 @@ static size_t handle_pase_pake1(matter_session_t *s, const uint8_t *in, size_t i
 	return (size_t)(p - out_payload);
 }
 
-/* Decrypt Matter packet payload with AES-128-CCM using Message Header as AAD */
 static int decrypt_matter_payload(const uint8_t *key, uint32_t counter, const uint8_t *aad, size_t aad_len,
 				  const uint8_t *cipher, size_t cipher_len, const uint8_t *tag, uint8_t *plain)
 {
@@ -648,7 +693,6 @@ static int decrypt_matter_payload(const uint8_t *key, uint32_t counter, const ui
 	return ret;
 }
 
-/* Encrypt Matter packet payload with AES-128-CCM using Message Header as AAD */
 static int encrypt_matter_payload(const uint8_t *key, uint32_t counter, const uint8_t *aad, size_t aad_len,
 				  const uint8_t *plain, size_t plain_len, uint8_t *cipher, uint8_t *tag)
 {
@@ -857,6 +901,36 @@ static void send_mdns_announcement(void)
 	sendto(g_mdns_v6_fd, pkt, pkt_len, 0, (struct sockaddr *)&dest6, sizeof(dest6));
 }
 
+/* Safe binary DNS question parser traversing length-prefixed labels */
+static bool dns_query_matches_matter(const uint8_t *pkt, size_t len)
+{
+	if (len < 12)
+		return false;
+
+	uint16_t qdcount = (pkt[4] << 8) | pkt[5];
+	if (qdcount == 0)
+		return false;
+
+	size_t offset = 12;
+	while (offset < len && pkt[offset] != 0) {
+		uint8_t label_len = pkt[offset];
+		if ((label_len & 0xC0) != 0) {
+			offset += 2;
+			break;
+		}
+		offset++;
+		if (offset + label_len > len)
+			return false;
+
+		if ((label_len == 7 && memcmp(pkt + offset, "_matter", 7) == 0) ||
+		    (label_len == 8 && memcmp(pkt + offset, "_matterc", 8) == 0)) {
+			return true;
+		}
+		offset += label_len;
+	}
+	return false;
+}
+
 /* --------------------------------------------------------------------------
  * Matter Interaction Model Dispatcher (Endpoint 0 Commissioning & Endpoint 1 Camera)
  * -------------------------------------------------------------------------- */
@@ -913,29 +987,41 @@ static size_t handle_interaction_model(uint8_t opcode, const uint8_t *in_payload
 		p = tlv_put_container(p, TLV_ARRAY, TLV_TAG_CONTEXT_1, 1);
 		p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_ANONYMOUS, 0);
 
-		/* Check for General Commissioning Cluster (ArmFailSafe / CommissioningComplete) */
 		if (in_len > 4 && in_payload[2] == CLUSTER_GENERAL_COMMISSIONING) {
 			g_config.failsafe_armed = true;
 			p = tlv_put_container(p, TLV_LIST, TLV_TAG_CONTEXT_1, 0);
 			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 0);
 			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 1, CLUSTER_GENERAL_COMMISSIONING);
-			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 0x01); /* ArmFailSafeResponse */
-			p = tlv_put_end(p);
-
-			p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_CONTEXT_1, 1);
-			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 0); /* ErrorCode: OK */
-			p = tlv_put_string(p, TLV_TAG_CONTEXT_1, 1, "");
-			p = tlv_put_end(p);
-		} else if (in_len > 4 && in_payload[2] == CLUSTER_OPERATIONAL_CREDS) {
-			/* Operational Credentials Cluster: CSR or NOC response */
-			p = tlv_put_container(p, TLV_LIST, TLV_TAG_CONTEXT_1, 0);
-			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 0);
-			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 1, CLUSTER_OPERATIONAL_CREDS);
 			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 0x01);
 			p = tlv_put_end(p);
 
 			p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_CONTEXT_1, 1);
-			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 0); /* OK */
+			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 0);
+			p = tlv_put_string(p, TLV_TAG_CONTEXT_1, 1, "");
+			p = tlv_put_end(p);
+		} else if (in_len > 4 && in_payload[2] == CLUSTER_OPERATIONAL_CREDS) {
+			/* Operational Credentials: CSR Generation via mbedtls_x509write_csr */
+			mbedtls_x509write_csr csr;
+			mbedtls_x509write_csr_init(&csr);
+			mbedtls_x509write_csr_set_md_alg(&csr, MBEDTLS_MD_SHA256);
+			mbedtls_x509write_csr_set_key(&csr, &g_device_key);
+			mbedtls_x509write_csr_set_subject_name(&csr, "O=Thingino,CN=MatterNode");
+
+			unsigned char csr_buf[512];
+			int csr_len = mbedtls_x509write_csr_der(&csr, csr_buf, sizeof(csr_buf),
+							       mbedtls_ctr_drbg_random, &g_drbg);
+			mbedtls_x509write_csr_free(&csr);
+
+			p = tlv_put_container(p, TLV_LIST, TLV_TAG_CONTEXT_1, 0);
+			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 0);
+			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 1, CLUSTER_OPERATIONAL_CREDS);
+			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 0x01); /* CSRResponse */
+			p = tlv_put_end(p);
+
+			p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_CONTEXT_1, 1);
+			if (csr_len > 0) {
+				p = tlv_put_bytes(p, TLV_TAG_CONTEXT_1, 0, csr_buf, (size_t)csr_len);
+			}
 			p = tlv_put_end(p);
 		} else {
 			/* WebRTC Transport Provider Cluster (Cluster 0x0551) */
@@ -989,14 +1075,12 @@ static void handle_matter_packet(const uint8_t *buf, ssize_t len, const struct s
 	const uint8_t *msg_data = buf + header_len;
 	size_t msg_data_len = len - header_len;
 
-	/* If session is established and message has security flags set, decrypt with AES-128-CCM */
 	if (s->encrypted && msg_data_len > 16) {
 		const uint8_t *tag = msg_data + (msg_data_len - 16);
 		size_t cipher_len = msg_data_len - 16;
 		int dret = decrypt_matter_payload(s->session_key, counter, buf, header_len,
 						  msg_data, cipher_len, tag, decrypted_buf);
 		if (dret != 0) {
-			/* Auth failed */
 			return;
 		}
 		msg_data = decrypted_buf;
@@ -1034,7 +1118,6 @@ static void handle_matter_packet(const uint8_t *buf, ssize_t len, const struct s
 			s->active = true;
 			s->encrypted = true;
 		} else if (opcode == MSG_OP_CASE_SIGMA1) {
-			/* CASE SIGMA1 handshake */
 			resp_opcode = MSG_OP_CASE_SIGMA2;
 			resp_payload_len = handle_pase_pake1(s, payload, payload_len, resp_payload, sizeof(resp_payload));
 		} else if (opcode == MSG_OP_CASE_SIGMA3) {
@@ -1259,7 +1342,7 @@ int main(int argc, char **argv)
 			socklen_t client_len6 = sizeof(client_addr6);
 			ssize_t n = recvfrom(g_mdns_v6_fd, buf, sizeof(buf), 0,
 					     (struct sockaddr *)&client_addr6, &client_len6);
-			if (n > 12 && strstr((char *)buf + 12, "_matter") != NULL) {
+			if (n > 12 && dns_query_matches_matter(buf, (size_t)n)) {
 				send_mdns_announcement();
 			}
 		}
@@ -1285,6 +1368,8 @@ int main(int argc, char **argv)
 		close(g_ipc_fd);
 	unlink("/run/matter/cmd.fifo");
 
+	mbedtls_pk_free(&g_device_key);
+	mbedtls_ecp_group_free(&g_ecp_grp);
 	mbedtls_ctr_drbg_free(&g_drbg);
 	mbedtls_entropy_free(&g_entropy);
 

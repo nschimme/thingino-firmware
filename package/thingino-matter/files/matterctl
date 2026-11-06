@@ -19,14 +19,27 @@ get_config() {
 
 case "$1" in
 	status)
-		if pidof matterd >/dev/null 2>&1; then
-			echo "matterd is running (PID $(pidof matterd))"
+		if [ "$2" = "--json" ]; then
+			if pidof matterd >/dev/null 2>&1; then
+				running="true"
+			else
+				running="false"
+			fi
 			disc=$(get_config "matter.discriminator")
 			pass=$(get_config "matter.passcode")
-			echo "Discriminator: ${disc:-3840}"
-			echo "Passcode: ${pass:-20202021}"
+			pairing=$(matterctl pairing-code 2>/dev/null)
+			printf '{"running":%s,"discriminator":%u,"passcode":%u,"pairing_code":"%s"}\n' \
+				"$running" "${disc:-3840}" "${pass:-20202021}" "$pairing"
 		else
-			echo "matterd is stopped"
+			if pidof matterd >/dev/null 2>&1; then
+				echo "matterd is running (PID $(pidof matterd))"
+				disc=$(get_config "matter.discriminator")
+				pass=$(get_config "matter.passcode")
+				echo "Discriminator: ${disc:-3840}"
+				echo "Passcode: ${pass:-20202021}"
+			else
+				echo "matterd is stopped"
+			fi
 		fi
 		;;
 	announce)
@@ -50,12 +63,12 @@ case "$1" in
 		fi
 		;;
 	pairing-code)
-		if pidof matterd >/dev/null 2>&1; then
-			code=$(matterctl status | sed -n 's/.*"pairing_code"[[:space:]]*:[[:space:]]*"\([0-9]*\)".*/\1/p')
-			[ -n "$code" ] && {
+		if [ -f /run/matter/pairing_code ]; then
+			code=$(cat /run/matter/pairing_code 2>/dev/null)
+			if [ -n "$code" ]; then
 				echo "$code"
 				exit 0
-			}
+			fi
 		fi
 		disc=$(get_config "matter.discriminator")
 		pass=$(get_config "matter.passcode")
