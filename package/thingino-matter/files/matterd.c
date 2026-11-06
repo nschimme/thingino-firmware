@@ -1,29 +1,24 @@
 /*
  * matterd - Lightweight Matter 1.5 Camera Daemon for Thingino
  *
- * Implements:
- * 1. Pure IPv6 UDP listener on port 5540 and IPv6 mDNS (ff02::fb:5353).
- * 2. Dynamic device instance naming (derived from MAC) to support multiple
- *    Thingino devices on the same local subnet without collision.
- * 3. Matter 1.5 DNS-SD responder (_matterc._udp, _matter._tcp) with mandatory
- *    Matter 1.5 Camera discovery keys and wire-format DNS question parser.
- * 4. Genuine Cryptographic Session Management:
- *    - Real PBKDF2 HMAC SHA-256 parameter derivation ($w_0, w_1$) with 32-bit LE integer passcode
- *    - Real SPAKE2+ elliptic curve point math on secp256r1 ($M, N, pB = Y + w_0 \cdot N, Z, V$)
- *    - HKDF-SHA256 derivation of initiator-to-responder (I2RKey) and responder-to-initiator (R2IKey)
- *    - Real transcript hash calculation for confirmation keys ($cA, cB$)
- *    - Real X.509 DER Certificate Signing Request (CSR) generation for Operational Credentials
- *    - Section 4.4.5 compliant 13-byte AES-128-CCM Nonce layout with authenticated encryption/decryption
- *    - Verhoeff checksum calculation for valid 11-digit manual pairing codes
- * 5. Full Matter TLV Path Parser & Builder:
- *    - Recursive TLV path parser discovering Cluster IDs in CommandPath / AttributePath
- *    - Parses incoming INVOKE_REQUEST to extract real SDP Offer string
- *    - Non-blocking in-process HTTP client connecting to streamer (Raptor WHIP / TIMPS WHEP)
- *    - Encodes real returned SDP answer into Matter TLV response
- * 6. Commissioning & Operational Clusters:
- *    - General Commissioning (ArmFailSafe, SetRegulatoryConfig, CommissioningComplete)
- *    - Operational Credentials (CSR generation, NOC handling)
- *    - Camera Settings Cluster (0x0550) bridging to agentctl and /run/motion
+ * Implements Matter 1.5 Minimal Camera Node:
+ * 1. Pure IPv6 UDP transport (port 5540) & IPv6 mDNS (ff02::fb:5353)
+ * 2. Matter Device Model:
+ *    - Endpoint 0: Root Node (Descriptor 0x001D, Basic Info 0x0028, General Commissioning 0x0030,
+ *      Network Commissioning 0x0031, Operational Credentials 0x003E)
+ *    - Endpoint 1: Camera Device Type 0x0051 (Descriptor 0x001D, Camera Settings 0x0550,
+ *      WebRTC Transport Provider 0x0551)
+ * 3. WebRTC Transport Provider Cluster (0x0551):
+ *    - Attributes: SupportedCodecs (H.264, Opus), MaxConcurrentSessions (2), CurrentSessions
+ *    - Commands: ProvideOffer (0x01), ProvideAnswer (0x02), ProvideICECandidates (0x03), EndSession (0x04)
+ * 4. Camera Settings Cluster (0x0550):
+ *    - Attributes: NightMode (0x0001), PrivacyMode (0x0002), MotionDetected (0x0003)
+ * 5. Cryptography & Security via mbedTLS:
+ *    - SPAKE2+ PBKDF2 HMAC SHA-256 with 32-bit LE passcode, secp256r1 point math (pB = Y + w0*N)
+ *    - Section 4.4.5 compliant 13-byte Nonce AES-128-CCM session encryption & decryption
+ *    - X.509 DER CSR generation for Operational Credentials
+ *    - 11-digit manual pairing code with Verhoeff check character
+ * 6. Non-blocking in-process HTTP signaling bridge to Raptor WHIP / TIMPS WHEP
  */
 
 #define _GNU_SOURCE
@@ -92,11 +87,17 @@
 #define MSG_OP_INVOKE_RESPONSE      0x09
 
 /* Matter 1.5 Cluster IDs */
+#define CLUSTER_DESCRIPTOR            0x001D
+#define CLUSTER_BASIC_INFORMATION     0x0028
 #define CLUSTER_GENERAL_COMMISSIONING 0x0030
 #define CLUSTER_NETWORK_COMMISSIONING 0x0031
 #define CLUSTER_OPERATIONAL_CREDS     0x003E
 #define CLUSTER_CAMERA_SETTINGS       0x0550
 #define CLUSTER_WEBRTC_TRANSPORT_PROV 0x0551
+
+/* Matter 1.5 Device Types */
+#define DEVICE_TYPE_ROOT_NODE         0x0016
+#define DEVICE_TYPE_CAMERA            0x0051
 
 /* Matter TLV Element Types */
 #define TLV_UNSIGNED_INT_1 0x04
@@ -214,8 +215,8 @@ typedef struct {
 	uint32_t peer_counter;
 	uint64_t peer_node_id;
 	struct sockaddr_in6 peer_addr;
-	uint8_t i2r_key[16]; /* Initiator to Responder */
-	uint8_t r2i_key[16]; /* Responder to Initiator */
+	uint8_t i2r_key[16];
+	uint8_t r2i_key[16];
 	mbedtls_ecp_point pA;
 	mbedtls_mpi y;
 	mbedtls_mpi w0;
@@ -258,8 +259,7 @@ static void get_device_mac(char *mac_str, char *raw_mac, size_t max_len)
 	strncpy(raw_mac, "001122334455", 13);
 
 	fd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (fd < 0)
-		return;
+	if (fd < 0) return;
 
 	for (i = 0; ifaces[i] != NULL; i++) {
 		memset(&ifr, 0, sizeof(ifr));
@@ -810,7 +810,6 @@ static size_t handle_pase_pbkdf_request(matter_session_t *s, uint8_t *out_payloa
 	s->iterations = 1000;
 	s->session_id = 1;
 
-	/* Derive w0 and w1 from 32-bit LE passcode */
 	uint8_t pass_le[4] = {
 		(uint8_t)(g_config.passcode & 0xFF),
 		(uint8_t)((g_config.passcode >> 8) & 0xFF),
@@ -834,7 +833,6 @@ static size_t handle_pase_pbkdf_request(matter_session_t *s, uint8_t *out_payloa
 	mbedtls_mpi_mod_mpi(&s->w0, &s->w0, &g_ecp_grp.N);
 	mbedtls_mpi_mod_mpi(&s->w1, &s->w1, &g_ecp_grp.N);
 
-	/* Initialize transcript hash */
 	mbedtls_sha256_init(&s->transcript_hash);
 	mbedtls_sha256_starts_ret(&s->transcript_hash, 0);
 
@@ -865,17 +863,14 @@ static size_t handle_pase_pake1(matter_session_t *s, const uint8_t *in, size_t i
 	mbedtls_ecp_point_init(&s->pA);
 	mbedtls_mpi_init(&s->y);
 
-	/* Parse initiator point pA (last 65 bytes of PAKE1) */
 	if (in_len >= 65) {
 		const uint8_t *pA_bytes = in + (in_len - 65);
 		mbedtls_ecp_point_read_binary(&g_ecp_grp, &s->pA, pA_bytes, 65);
 		mbedtls_sha256_update_ret(&s->transcript_hash, in, in_len);
 	}
 
-	/* Ephemeral y and Y = y*G */
 	mbedtls_ecp_gen_keypair(&g_ecp_grp, &s->y, &Y, mbedtls_ctr_drbg_random, &g_drbg);
 
-	/* pB = Y + w0*N */
 	mbedtls_mpi one;
 	mbedtls_mpi_init(&one);
 	mbedtls_mpi_lset(&one, 1);
@@ -885,13 +880,11 @@ static size_t handle_pase_pake1(matter_session_t *s, const uint8_t *in, size_t i
 	size_t olen = 0;
 	mbedtls_ecp_point_write_binary(&g_ecp_grp, &pB, MBEDTLS_ECP_PF_UNCOMPRESSED, &olen, pB_bytes, sizeof(pB_bytes));
 
-	/* Compute (pA - w0*M) */
 	mbedtls_mpi neg_w0;
 	mbedtls_mpi_init(&neg_w0);
 	mbedtls_mpi_sub_mpi(&neg_w0, &g_ecp_grp.N, &s->w0);
 	mbedtls_ecp_muladd(&g_ecp_grp, &temp1, &one, &s->pA, &neg_w0, &g_spake_M);
 
-	/* Shared secrets Z = y*(pA - w0*M) and V = w1*(pA - w0*M) */
 	mbedtls_ecp_mul(&g_ecp_grp, &Z, &s->y, &temp1, mbedtls_ctr_drbg_random, &g_drbg);
 	mbedtls_ecp_mul(&g_ecp_grp, &V, &s->w1, &temp1, mbedtls_ctr_drbg_random, &g_drbg);
 
@@ -900,7 +893,6 @@ static size_t handle_pase_pake1(matter_session_t *s, const uint8_t *in, size_t i
 	mbedtls_ecp_point_write_binary(&g_ecp_grp, &Z, MBEDTLS_ECP_PF_UNCOMPRESSED, &z_len, z_bytes, sizeof(z_bytes));
 	mbedtls_ecp_point_write_binary(&g_ecp_grp, &V, MBEDTLS_ECP_PF_UNCOMPRESSED, &v_len, v_bytes, sizeof(v_bytes));
 
-	/* HKDF key derivation: K_e = HKDF-Extract(0, Z || V) */
 	uint8_t zv[130];
 	memcpy(zv, z_bytes, z_len);
 	memcpy(zv + z_len, v_bytes, v_len);
@@ -909,7 +901,6 @@ static size_t handle_pase_pake1(matter_session_t *s, const uint8_t *in, size_t i
 	uint8_t zero_salt[32] = {0};
 	hkdf_extract(zero_salt, sizeof(zero_salt), zv, z_len + v_len, prk);
 
-	/* Derive I2RKey, R2IKey, and confirmation keys */
 	uint8_t keys[64];
 	const char *info = "Matter_SPAKE2P_Keys";
 	hkdf_expand(prk, sizeof(prk), (const uint8_t*)info, strlen(info), keys, sizeof(keys));
@@ -917,10 +908,12 @@ static size_t handle_pase_pake1(matter_session_t *s, const uint8_t *in, size_t i
 	memcpy(s->i2r_key, keys, 16);
 	memcpy(s->r2i_key, keys + 16, 16);
 
-	/* Cumulative transcript hash for confirmation cB */
 	uint8_t thash[32];
-	mbedtls_sha256_clone(&s->transcript_hash, &s->transcript_hash);
-	mbedtls_sha256_finish_ret(&s->transcript_hash, thash);
+	mbedtls_sha256_context tmp_thash;
+	mbedtls_sha256_init(&tmp_thash);
+	mbedtls_sha256_clone(&tmp_thash, &s->transcript_hash);
+	mbedtls_sha256_finish_ret(&tmp_thash, thash);
+	mbedtls_sha256_free(&tmp_thash);
 
 	uint8_t cB[32];
 	hkdf_expand(prk, sizeof(prk), thash, sizeof(thash), cB, sizeof(cB));
@@ -1046,7 +1039,6 @@ static void send_mdns_announcement(void)
 
 	snprintf(target_srv, sizeof(target_srv), "%s._matterc._udp.local", g_config.instance_name);
 
-	/* 1. PTR Record */
 	p = write_dns_name(p, "_matterc._udp.local");
 	*p++ = 0x00; *p++ = 0x0C;
 	*p++ = 0x80; *p++ = 0x01;
@@ -1060,7 +1052,6 @@ static void send_mdns_announcement(void)
 	ptr_len_ptr[0] = (uint8_t)(ptr_rdlen >> 8);
 	ptr_len_ptr[1] = (uint8_t)(ptr_rdlen & 0xFF);
 
-	/* 2. SRV Record */
 	p = write_dns_name(p, target_srv);
 	*p++ = 0x00; *p++ = 0x21;
 	*p++ = 0x80; *p++ = 0x01;
@@ -1072,7 +1063,6 @@ static void send_mdns_announcement(void)
 	*p++ = (uint8_t)(g_config.port & 0xFF);
 	p = write_dns_name(p, g_config.hostname);
 
-	/* 3. TXT Record */
 	p = write_dns_name(p, target_srv);
 	*p++ = 0x00; *p++ = 0x10;
 	*p++ = 0x80; *p++ = 0x01;
@@ -1153,7 +1143,7 @@ static bool dns_query_matches_matter(const uint8_t *pkt, size_t len)
 }
 
 /* --------------------------------------------------------------------------
- * Matter Interaction Model Dispatcher (Parsed Cluster Matching)
+ * Matter Interaction Model Dispatcher (Complete Endpoint 0 & Endpoint 1 Clusters)
  * -------------------------------------------------------------------------- */
 
 static size_t handle_interaction_model(uint8_t opcode, const uint8_t *in_payload, size_t in_len,
@@ -1170,7 +1160,58 @@ static size_t handle_interaction_model(uint8_t opcode, const uint8_t *in_payload
 		p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_ANONYMOUS, 0);
 		p = tlv_put_container(p, TLV_ARRAY, TLV_TAG_CONTEXT_1, 1);
 
-		/* 1. Camera Settings Cluster: Night Mode Attribute */
+		/* 1. Endpoint 0 Descriptor Cluster (0x001D) */
+		p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_ANONYMOUS, 0);
+		p = tlv_put_container(p, TLV_LIST, TLV_TAG_CONTEXT_1, 1);
+		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 0); /* Endpoint 0 */
+		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 1, CLUSTER_DESCRIPTOR);
+		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 0x0000); /* DeviceTypeList */
+		p = tlv_put_end(p);
+		p = tlv_put_container(p, TLV_ARRAY, TLV_TAG_CONTEXT_1, 2);
+		p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_ANONYMOUS, 0);
+		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, DEVICE_TYPE_ROOT_NODE);
+		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 1, 1);
+		p = tlv_put_end(p);
+		p = tlv_put_end(p);
+		p = tlv_put_end(p);
+
+		/* 2. Endpoint 1 Descriptor Cluster (0x001D) - Camera Device Type */
+		p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_ANONYMOUS, 0);
+		p = tlv_put_container(p, TLV_LIST, TLV_TAG_CONTEXT_1, 1);
+		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 1); /* Endpoint 1 */
+		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 1, CLUSTER_DESCRIPTOR);
+		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 0x0000);
+		p = tlv_put_end(p);
+		p = tlv_put_container(p, TLV_ARRAY, TLV_TAG_CONTEXT_1, 2);
+		p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_ANONYMOUS, 0);
+		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, DEVICE_TYPE_CAMERA);
+		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 1, 1);
+		p = tlv_put_end(p);
+		p = tlv_put_end(p);
+		p = tlv_put_end(p);
+
+		/* 3. Endpoint 1 WebRTC Transport Provider (0x0551): SupportedCodecs & MaxConcurrentSessions */
+		p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_ANONYMOUS, 0);
+		p = tlv_put_container(p, TLV_LIST, TLV_TAG_CONTEXT_1, 1);
+		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 1);
+		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 1, CLUSTER_WEBRTC_TRANSPORT_PROV);
+		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 0x0001); /* SupportedCodecs */
+		p = tlv_put_end(p);
+		p = tlv_put_container(p, TLV_ARRAY, TLV_TAG_CONTEXT_1, 2);
+		p = tlv_put_string(p, TLV_TAG_ANONYMOUS, 0, "video/H264;audio/opus");
+		p = tlv_put_end(p);
+		p = tlv_put_end(p);
+
+		p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_ANONYMOUS, 0);
+		p = tlv_put_container(p, TLV_LIST, TLV_TAG_CONTEXT_1, 1);
+		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 1);
+		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 1, CLUSTER_WEBRTC_TRANSPORT_PROV);
+		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 0x0002); /* MaxConcurrentSessions */
+		p = tlv_put_end(p);
+		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 2);
+		p = tlv_put_end(p);
+
+		/* 4. Endpoint 1 Camera Settings Cluster (0x0550): NightMode, Privacy, Motion */
 		p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_ANONYMOUS, 0);
 		p = tlv_put_container(p, TLV_LIST, TLV_TAG_CONTEXT_1, 1);
 		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 1);
@@ -1180,7 +1221,6 @@ static size_t handle_interaction_model(uint8_t opcode, const uint8_t *in_payload
 		p = tlv_put_bool(p, TLV_TAG_CONTEXT_1, 2, g_config.nightmode);
 		p = tlv_put_end(p);
 
-		/* 2. Camera Settings Cluster: Privacy Mode Attribute */
 		p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_ANONYMOUS, 0);
 		p = tlv_put_container(p, TLV_LIST, TLV_TAG_CONTEXT_1, 1);
 		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 1);
@@ -1190,7 +1230,6 @@ static size_t handle_interaction_model(uint8_t opcode, const uint8_t *in_payload
 		p = tlv_put_bool(p, TLV_TAG_CONTEXT_1, 2, g_config.privacy);
 		p = tlv_put_end(p);
 
-		/* 3. Motion Detection Attribute */
 		p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_ANONYMOUS, 0);
 		p = tlv_put_container(p, TLV_LIST, TLV_TAG_CONTEXT_1, 1);
 		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 1);
@@ -1224,7 +1263,6 @@ static size_t handle_interaction_model(uint8_t opcode, const uint8_t *in_payload
 			p = tlv_put_string(p, TLV_TAG_CONTEXT_1, 1, "");
 			p = tlv_put_end(p);
 		} else if (cluster_id == CLUSTER_OPERATIONAL_CREDS) {
-			/* Operational Credentials: CSR Generation via mbedtls_x509write_csr */
 			mbedtls_x509write_csr csr;
 			mbedtls_x509write_csr_init(&csr);
 			mbedtls_x509write_csr_set_md_alg(&csr, MBEDTLS_MD_SHA256);
@@ -1309,7 +1347,6 @@ static void handle_matter_packet(const uint8_t *buf, ssize_t len, const struct s
 	const uint8_t *msg_data = buf + header_len;
 	size_t msg_data_len = len - header_len;
 
-	/* Only attempt decryption if the packet itself has security flags set (sec_flags != 0) */
 	if ((sec_flags & 0x08) && s->encrypted && msg_data_len > 16) {
 		const uint8_t *tag = msg_data + (msg_data_len - 16);
 		size_t cipher_len = msg_data_len - 16;

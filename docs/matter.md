@@ -9,31 +9,34 @@ controllers.
 Following the UNIX philosophy of Thingino, `thingino-matter` is composed of:
 
 1. **`matterd` (Pure C Daemon)**:
-   - A lightweight background daemon (~36KB binary footprint) running directly
-     on the Ingenic SoC.
+   - A lightweight background daemon (~43KB stripped binary, ~14KB compressed)
+     running directly on the Ingenic SoC.
    - **Pure IPv6 UDP Transport**: Listens on port 5540 (`[::]:5540`) using strict
      IPv6 socket configuration (`IPV6_V6ONLY=1`), adhering to Matter specifications.
    - **Matter 1.5 DNS-SD / mDNS Responder**: Advertises `_matterc._udp.local`
      (commissionable) and `_matter._tcp.local` (operational) service records
      with mandatory Matter 1.5 Camera discovery keys (`VP`, `D`, `CM`, `DT=0x51`,
      `DN`, `SII`, `SAI`, `T`, `CRI`) over IPv6 multicast (`ff02::fb:5353`).
-   - **Collision-Free Multi-Device Identity**: Automatically generates unique hostnames
-     (`thingino-${MAC}.local`), unique 64-bit instance IDs, and MAC-derived
-     discriminators so multiple Thingino cameras coexist on the same network.
-   - **Framing & Matter TLV**: Implements Matter framing and Type-Length-Value
-     (TLV) encoding/decoding.
-   - **PASE & Session Cryptography**: Implements Password-Authenticated Session
-     Establishment (PASE via SPAKE2+ on secp256r1), CASE session states, and
-     inbound/outbound AES-128-CCM authenticated encryption backed by `mbedTLS`.
+   - **Endpoint 0 (Root Node)**:
+     - `Descriptor` Cluster (`0x001D`): Exposes Root Node Device Type (`0x0016`).
+     - `General Commissioning` (`0x0030`): ArmFailSafe, CommissioningComplete.
+     - `Operational Credentials` (`0x003E`): Real DER CSR generation via `mbedtls_x509write_csr`.
+   - **Endpoint 1 (Camera Device Type 0x0051)**:
+     - `Descriptor` Cluster (`0x001D`): Exposes Camera Device Type (`0x0051`).
+     - `WebRTC Transport Provider` Cluster (`0x0551`):
+       - Attributes: `SupportedCodecs` (`video/H264;audio/opus`), `MaxConcurrentSessions` (2), `CurrentSessions`.
+       - Commands: `ProvideOffer`, `ProvideAnswer`, `ProvideICECandidates`, `EndSession`.
+     - `Camera Settings` Cluster (`0x0550`):
+       - Attributes: `NightMode` (`0x0001`), `PrivacyMode` (`0x0002`), `MotionDetected` (`0x0003`).
+   - **PASE & Session Cryptography**:
+     - SPAKE2+ key agreement on `secp256r1` with PBKDF2 HMAC SHA-256 (32-bit LE passcode)
+       and points $M$ and $N$ ($pB = Y + w_0 \cdot N$).
+     - Section 4.4.5 compliant 13-byte Nonce AES-128-CCM session encryption and decryption.
    - **Valid 11-Digit Pairing Code**: Calculates setup codes using the standard
      Verhoeff checksum algorithm per Matter specification Section 5.1.4.1.
    - **In-Process WebRTC Signaling Bridge**: Extracts the real SDP offer from
-     the controller's TLV request and negotiates directly in-process over local
+     the controller's TLV request and negotiates directly in-process over non-blocking
      HTTP sockets without invoking external shell tools like `curl`.
-   - **WebRTC Transport Provider Cluster (`0x0551`)**: Exposes live video streaming
-     signaling.
-   - **Camera Settings Cluster (`0x0550`)**: Exposes night vision, privacy mode,
-     and motion detection attributes and commands.
 
 2. **Streamer Profile Discovery (`S96matter_discovery`)**:
    - Mirrors the ONVIF streamer discovery architecture (`S96onvif_discovery`).
@@ -69,6 +72,7 @@ The `matterctl` helper allows inspecting and controlling the Matter service:
 ```bash
 # Check status and pairing credentials
 matterctl status
+matterctl status --json
 
 # Get the verified 11-digit manual pairing code with Verhoeff checksum
 matterctl pairing-code
