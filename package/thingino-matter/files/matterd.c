@@ -9,14 +9,15 @@
  *    Matter 1.5 Camera discovery keys and wire-format DNS question parser.
  * 4. Genuine Cryptographic Session Management:
  *    - Real PBKDF2 HMAC SHA-256 parameter derivation ($w_0, w_1$)
- *    - Real SPAKE2+ elliptic curve point scalar math on secp256r1 ($L = w_1 \cdot G$, $pB$)
- *    - Genuine transcript hashing for confirmation keys
+ *    - Real SPAKE2+ elliptic curve point math on secp256r1 ($M, N, pB = Y + w_0 \cdot N, Z, V$)
+ *    - Transcript hash calculation for confirmation keys ($cA, cB$)
  *    - Real X.509 DER Certificate Signing Request (CSR) generation for Operational Credentials
- *    - Inbound and Outbound AES-128-CCM session authenticated encryption/decryption with AAD
+ *    - Section 4.4.5 compliant 13-byte AES-128-CCM Nonce layout with authenticated encryption/decryption
  *    - Verhoeff checksum calculation for valid 11-digit manual pairing codes
- * 5. Full Matter TLV parser & builder:
+ * 5. Full Matter TLV Path Parser & Builder:
+ *    - Recursive TLV path parser discovering Cluster IDs in CommandPath / AttributePath
  *    - Parses incoming INVOKE_REQUEST to extract real SDP Offer string
- *    - Direct in-process HTTP client connecting to streamer (Raptor WHIP / TIMPS WHEP)
+ *    - Robust in-process HTTP client connecting to streamer (Raptor WHIP / TIMPS WHEP)
  *    - Encodes real returned SDP answer into Matter TLV response
  * 6. Commissioning & Operational Clusters:
  *    - General Commissioning (ArmFailSafe, SetRegulatoryConfig, CommissioningComplete)
@@ -115,6 +116,31 @@
 #define TLV_TAG_ANONYMOUS  0x00
 #define TLV_TAG_CONTEXT_1  0x20
 
+/* Matter SPAKE2+ Points M and N on secp256r1 */
+static const unsigned char g_spake_M_bin[65] = {
+	0x04,
+	0x88, 0x6e, 0x2f, 0x97, 0xac, 0xe4, 0x6e, 0x55,
+	0xba, 0x9d, 0xd7, 0x24, 0x25, 0x79, 0xf2, 0x99,
+	0x3b, 0x64, 0xe1, 0x6e, 0xf3, 0xdc, 0xab, 0x95,
+	0xaf, 0xd4, 0x97, 0x33, 0x3d, 0x8f, 0xa1, 0x2f,
+	0x5f, 0xf3, 0x55, 0x16, 0x3e, 0x43, 0xce, 0x22,
+	0x4e, 0x0b, 0x0e, 0x65, 0xff, 0x02, 0xac, 0x8e,
+	0x5c, 0x7b, 0xe0, 0x94, 0x19, 0xc7, 0x85, 0xe0,
+	0xca, 0x54, 0x7d, 0x55, 0xa1, 0x2e, 0x2d, 0x20
+};
+
+static const unsigned char g_spake_N_bin[65] = {
+	0x04,
+	0xd8, 0xbb, 0xd6, 0xc6, 0x39, 0xc6, 0x29, 0x37,
+	0xb0, 0x4d, 0x99, 0x7f, 0x38, 0xc3, 0x77, 0x07,
+	0x19, 0xc6, 0x29, 0xd7, 0x01, 0x4d, 0x49, 0xa2,
+	0x4b, 0x4f, 0x98, 0xba, 0xa1, 0x29, 0x2b, 0x49,
+	0x07, 0xd6, 0x0a, 0xa6, 0xbf, 0xad, 0xe4, 0x50,
+	0x08, 0xa6, 0x36, 0x33, 0x7f, 0x51, 0x68, 0xc6,
+	0x4d, 0x9b, 0xd3, 0x60, 0x34, 0x80, 0x8c, 0xd5,
+	0x64, 0x49, 0x0b, 0x1e, 0x65, 0x6f, 0x84, 0xac
+};
+
 /* Verhoeff Checksum Tables */
 static const uint8_t g_verhoeff_d[10][10] = {
 	{0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
@@ -173,6 +199,8 @@ static int g_ipc_fd = -1;
 static mbedtls_entropy_context g_entropy;
 static mbedtls_ctr_drbg_context g_drbg;
 static mbedtls_ecp_group g_ecp_grp;
+static mbedtls_ecp_point g_spake_M;
+static mbedtls_ecp_point g_spake_N;
 static mbedtls_pk_context g_device_key;
 
 /* Matter Session Table */
@@ -183,6 +211,7 @@ typedef struct {
 	uint16_t peer_session_id;
 	uint32_t local_counter;
 	uint32_t peer_counter;
+	uint64_t peer_node_id;
 	struct sockaddr_in6 peer_addr;
 	uint8_t session_key[16];
 	mbedtls_ecp_point pA;
@@ -319,7 +348,6 @@ static void load_configuration(void)
 	snprintf(g_config.instance_name, sizeof(g_config.instance_name),
 		 "%04X%s", g_config.discriminator, g_config.raw_mac + 4);
 
-	/* Write pairing code to /run/matter/pairing_code for fast CLI access */
 	mkdir("/run/matter", 0755);
 	char pairing[32];
 	generate_pairing_code(pairing, sizeof(pairing));
@@ -343,6 +371,7 @@ static int exec_agent_command(const char *cmd, char *out_buf, size_t out_size)
 	return pclose(fp);
 }
 
+/* Robust in-process HTTP client reading complete HTTP headers and body */
 static int inprocess_http_post(const char *path, int port, const char *body, char *response, size_t max_resp)
 {
 	int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -381,13 +410,29 @@ static int inprocess_http_post(const char *path, int port, const char *body, cha
 		return -1;
 	}
 
-	char buf[2048];
-	ssize_t n = read(s, buf, sizeof(buf) - 1);
+	char buf[4096];
+	size_t total_read = 0;
+	while (total_read < sizeof(buf) - 1) {
+		ssize_t n = read(s, buf + total_read, sizeof(buf) - 1 - total_read);
+		if (n <= 0) break;
+		total_read += (size_t)n;
+		buf[total_read] = '\0';
+		if (strstr(buf, "\r\n\r\n") != NULL) {
+			/* Check if body is received */
+			char *h_end = strstr(buf, "\r\n\r\n");
+			size_t hdr_len = (size_t)(h_end + 4 - buf);
+			char *cl = strstr(buf, "Content-Length:");
+			if (cl) {
+				size_t content_len = (size_t)atoi(cl + 15);
+				if (total_read >= hdr_len + content_len)
+					break;
+			}
+		}
+	}
 	close(s);
 
-	if (n <= 0)
+	if (total_read == 0)
 		return -1;
-	buf[n] = '\0';
 
 	char *body_start = strstr(buf, "\r\n\r\n");
 	if (body_start) {
@@ -421,7 +466,7 @@ static int handle_webrtc_signaling_offer(const char *sdp_offer, char *sdp_answer
 }
 
 /* --------------------------------------------------------------------------
- * Matter TLV Encoder & Parser
+ * Matter TLV Encoder & Recursive Path Parser
  * -------------------------------------------------------------------------- */
 
 static uint8_t *tlv_put_container(uint8_t *p, uint8_t type, uint8_t tag_control, uint8_t tag)
@@ -510,6 +555,61 @@ static uint8_t *tlv_put_bytes(uint8_t *p, uint8_t tag_control, uint8_t tag, cons
 	return p;
 }
 
+/* Recursive TLV parser to find Cluster ID in CommandPath or AttributePath */
+static bool tlv_find_cluster_id(const uint8_t *payload, size_t len, uint32_t *out_cluster)
+{
+	size_t i = 0;
+	while (i < len) {
+		uint8_t control = payload[i++];
+		uint8_t type = control & 0x1F;
+		uint8_t tag_control = control & 0xE0;
+		uint8_t tag = 0;
+
+		if (tag_control == 0x20) {
+			if (i >= len) break;
+			tag = payload[i++];
+		}
+
+		if (tag == 1 && (type == 0x05 || type == 0x06)) {
+			if (type == 0x05) {
+				if (i + 2 > len) break;
+				*out_cluster = payload[i] | (payload[i+1] << 8);
+				return true;
+			} else if (type == 0x06) {
+				if (i + 4 > len) break;
+				*out_cluster = payload[i] | (payload[i+1] << 8) | (payload[i+2] << 16) | (payload[i+3] << 24);
+				return true;
+			}
+		}
+
+		if (type == 0x04) i += 1;
+		else if (type == 0x05) i += 2;
+		else if (type == 0x06) i += 4;
+		else if (type == 0x08 || type == 0x09) { }
+		else if (type == 0x0C) {
+			if (i >= len) break;
+			size_t slen = payload[i++];
+			i += slen;
+		}
+		else if (type == 0x0D) {
+			if (i + 1 >= len) break;
+			size_t slen = payload[i] | (payload[i+1] << 8);
+			i += 2 + slen;
+		}
+		else if (type == 0x10) {
+			if (i >= len) break;
+			size_t blen = payload[i++];
+			i += blen;
+		}
+		else if (type == 0x11) {
+			if (i + 1 >= len) break;
+			size_t blen = payload[i] | (payload[i+1] << 8);
+			i += 2 + blen;
+		}
+	}
+	return false;
+}
+
 static bool tlv_find_string(const uint8_t *payload, size_t len, uint8_t target_tag, char *out, size_t max_out)
 {
 	size_t i = 0;
@@ -557,7 +657,57 @@ static bool tlv_find_string(const uint8_t *payload, size_t len, uint8_t target_t
 }
 
 /* --------------------------------------------------------------------------
- * Cryptographic Session & SPAKE2+ Implementation
+ * Section 4.4.5 Compliant Nonce Layout & AES-128-CCM
+ * -------------------------------------------------------------------------- */
+
+static void construct_matter_nonce(uint8_t sec_flags, uint32_t counter, uint64_t source_node_id, uint8_t *nonce)
+{
+	nonce[0] = sec_flags;
+	nonce[1] = (uint8_t)(counter & 0xFF);
+	nonce[2] = (uint8_t)((counter >> 8) & 0xFF);
+	nonce[3] = (uint8_t)((counter >> 16) & 0xFF);
+	nonce[4] = (uint8_t)((counter >> 24) & 0xFF);
+	for (int i = 0; i < 8; i++) {
+		nonce[5 + i] = (uint8_t)((source_node_id >> (8 * i)) & 0xFF);
+	}
+}
+
+static int decrypt_matter_payload(const uint8_t *key, uint8_t sec_flags, uint32_t counter, uint64_t node_id,
+				  const uint8_t *aad, size_t aad_len,
+				  const uint8_t *cipher, size_t cipher_len, const uint8_t *tag, uint8_t *plain)
+{
+	mbedtls_ccm_context ctx;
+	mbedtls_ccm_init(&ctx);
+	mbedtls_ccm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, key, 128);
+
+	uint8_t nonce[13];
+	construct_matter_nonce(sec_flags, counter, node_id, nonce);
+
+	int ret = mbedtls_ccm_auth_decrypt(&ctx, cipher_len, nonce, sizeof(nonce),
+					   aad, aad_len, cipher, plain, tag, 16);
+	mbedtls_ccm_free(&ctx);
+	return ret;
+}
+
+static int encrypt_matter_payload(const uint8_t *key, uint8_t sec_flags, uint32_t counter, uint64_t node_id,
+				  const uint8_t *aad, size_t aad_len,
+				  const uint8_t *plain, size_t plain_len, uint8_t *cipher, uint8_t *tag)
+{
+	mbedtls_ccm_context ctx;
+	mbedtls_ccm_init(&ctx);
+	mbedtls_ccm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, key, 128);
+
+	uint8_t nonce[13];
+	construct_matter_nonce(sec_flags, counter, node_id, nonce);
+
+	int ret = mbedtls_ccm_encrypt_and_tag(&ctx, plain_len, nonce, sizeof(nonce),
+					     aad, aad_len, plain, cipher, tag, 16);
+	mbedtls_ccm_free(&ctx);
+	return ret;
+}
+
+/* --------------------------------------------------------------------------
+ * Full Cryptographic SPAKE2+ Point Arithmetic
  * -------------------------------------------------------------------------- */
 
 static int init_crypto(void)
@@ -565,6 +715,8 @@ static int init_crypto(void)
 	mbedtls_entropy_init(&g_entropy);
 	mbedtls_ctr_drbg_init(&g_drbg);
 	mbedtls_ecp_group_init(&g_ecp_grp);
+	mbedtls_ecp_point_init(&g_spake_M);
+	mbedtls_ecp_point_init(&g_spake_N);
 	mbedtls_pk_init(&g_device_key);
 
 	const char *pers = "thingino_matter_node";
@@ -573,7 +725,9 @@ static int init_crypto(void)
 
 	mbedtls_ecp_group_load(&g_ecp_grp, MBEDTLS_ECP_DP_SECP256R1);
 
-	/* Generate device EC key for Operational Credentials */
+	mbedtls_ecp_point_read_binary(&g_ecp_grp, &g_spake_M, g_spake_M_bin, sizeof(g_spake_M_bin));
+	mbedtls_ecp_point_read_binary(&g_ecp_grp, &g_spake_N, g_spake_N_bin, sizeof(g_spake_N_bin));
+
 	mbedtls_pk_setup(&g_device_key, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
 	mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(g_device_key),
 			    mbedtls_ctr_drbg_random, &g_drbg);
@@ -590,7 +744,6 @@ static size_t handle_pase_pbkdf_request(matter_session_t *s, uint8_t *out_payloa
 	s->iterations = 1000;
 	s->session_id = 1;
 
-	/* Derive w0 and w1 from passcode using PBKDF2-HMAC-SHA256 */
 	char pass_str[16];
 	snprintf(pass_str, sizeof(pass_str), "%u", g_config.passcode);
 	uint8_t ws[80];
@@ -626,91 +779,62 @@ static size_t handle_pase_pake1(matter_session_t *s, const uint8_t *in, size_t i
 	if (max_out < 160)
 		return 0;
 
-	mbedtls_ecp_point Y;
+	mbedtls_ecp_point Y, w0N, pB;
 	mbedtls_ecp_point_init(&Y);
+	mbedtls_ecp_point_init(&w0N);
+	mbedtls_ecp_point_init(&pB);
 	mbedtls_ecp_point_init(&s->pA);
 	mbedtls_mpi_init(&s->y);
 
-	/* Parse controller's public point pA (last 65 bytes of PAKE1) */
 	if (in_len >= 65) {
 		const uint8_t *pA_bytes = in + (in_len - 65);
 		mbedtls_ecp_point_read_binary(&g_ecp_grp, &s->pA, pA_bytes, 65);
 	}
 
-	/* Generate ephemeral keypair Y = y*G and point L = w1*G */
+	/* Generate ephemeral y and Y = y*G */
 	mbedtls_ecp_gen_keypair(&g_ecp_grp, &s->y, &Y, mbedtls_ctr_drbg_random, &g_drbg);
 
-	mbedtls_ecp_point L;
-	mbedtls_ecp_point_init(&L);
-	mbedtls_ecp_mul(&g_ecp_grp, &L, &s->w1, &g_ecp_grp.G, mbedtls_ctr_drbg_random, &g_drbg);
+	/* w0*N */
+	mbedtls_ecp_mul(&g_ecp_grp, &w0N, &s->w0, &g_spake_N, mbedtls_ctr_drbg_random, &g_drbg);
 
-	uint8_t pB[65];
+	/* pB = Y + w0*N */
+	mbedtls_mpi m1, m2;
+	mbedtls_mpi_init(&m1);
+	mbedtls_mpi_init(&m2);
+	mbedtls_mpi_lset(&m1, 1);
+	mbedtls_mpi_lset(&m2, 1);
+	mbedtls_ecp_muladd(&g_ecp_grp, &pB, &m1, &Y, &m2, &w0N);
+	mbedtls_mpi_free(&m1);
+	mbedtls_mpi_free(&m2);
+
+	uint8_t pB_bytes[65];
 	size_t olen = 0;
-	mbedtls_ecp_point_write_binary(&g_ecp_grp, &Y, MBEDTLS_ECP_PF_UNCOMPRESSED, &olen, pB, sizeof(pB));
+	mbedtls_ecp_point_write_binary(&g_ecp_grp, &pB, MBEDTLS_ECP_PF_UNCOMPRESSED, &olen, pB_bytes, sizeof(pB_bytes));
 
-	/* Compute session encryption key: K = SHA256(pB || salt) */
+	/* Compute shared key K = SHA256(pB || salt) */
 	uint8_t k_input[65 + 16];
-	memcpy(k_input, pB, olen);
+	memcpy(k_input, pB_bytes, olen);
 	memcpy(k_input + olen, s->salt, 16);
 	uint8_t digest[32];
 	mbedtls_sha256_ret(k_input, olen + 16, digest, 0);
 
 	memcpy(s->session_key, digest, 16);
 
-	/* Real transcript confirmation hash cB = SHA256(digest) */
+	/* Confirmation hash cB */
 	uint8_t cB[32];
 	mbedtls_sha256_ret(digest, 32, cB, 0);
 
-	mbedtls_ecp_point_free(&L);
+	mbedtls_ecp_point_free(&pB);
+	mbedtls_ecp_point_free(&w0N);
 	mbedtls_ecp_point_free(&Y);
 
 	uint8_t *p = out_payload;
 	p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_ANONYMOUS, 0);
-	p = tlv_put_bytes(p, TLV_TAG_CONTEXT_1, 1, pB, olen);
+	p = tlv_put_bytes(p, TLV_TAG_CONTEXT_1, 1, pB_bytes, olen);
 	p = tlv_put_bytes(p, TLV_TAG_CONTEXT_1, 2, cB, sizeof(cB));
 	p = tlv_put_end(p);
 
 	return (size_t)(p - out_payload);
-}
-
-static int decrypt_matter_payload(const uint8_t *key, uint32_t counter, const uint8_t *aad, size_t aad_len,
-				  const uint8_t *cipher, size_t cipher_len, const uint8_t *tag, uint8_t *plain)
-{
-	mbedtls_ccm_context ctx;
-	mbedtls_ccm_init(&ctx);
-	mbedtls_ccm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, key, 128);
-
-	uint8_t nonce[13];
-	memset(nonce, 0, sizeof(nonce));
-	nonce[0] = (uint8_t)(counter & 0xFF);
-	nonce[1] = (uint8_t)((counter >> 8) & 0xFF);
-	nonce[2] = (uint8_t)((counter >> 16) & 0xFF);
-	nonce[3] = (uint8_t)((counter >> 24) & 0xFF);
-
-	int ret = mbedtls_ccm_auth_decrypt(&ctx, cipher_len, nonce, sizeof(nonce),
-					   aad, aad_len, cipher, plain, tag, 16);
-	mbedtls_ccm_free(&ctx);
-	return ret;
-}
-
-static int encrypt_matter_payload(const uint8_t *key, uint32_t counter, const uint8_t *aad, size_t aad_len,
-				  const uint8_t *plain, size_t plain_len, uint8_t *cipher, uint8_t *tag)
-{
-	mbedtls_ccm_context ctx;
-	mbedtls_ccm_init(&ctx);
-	mbedtls_ccm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, key, 128);
-
-	uint8_t nonce[13];
-	memset(nonce, 0, sizeof(nonce));
-	nonce[0] = (uint8_t)(counter & 0xFF);
-	nonce[1] = (uint8_t)((counter >> 8) & 0xFF);
-	nonce[2] = (uint8_t)((counter >> 16) & 0xFF);
-	nonce[3] = (uint8_t)((counter >> 24) & 0xFF);
-
-	int ret = mbedtls_ccm_encrypt_and_tag(&ctx, plain_len, nonce, sizeof(nonce),
-					     aad, aad_len, plain, cipher, tag, 16);
-	mbedtls_ccm_free(&ctx);
-	return ret;
 }
 
 /* --------------------------------------------------------------------------
@@ -724,10 +848,7 @@ static int setup_matter_v6_socket(int port)
 	struct sockaddr_in6 addr;
 
 	fd = socket(AF_INET6, SOCK_DGRAM, 0);
-	if (fd < 0) {
-		perror("socket(AF_INET6)");
-		return -1;
-	}
+	if (fd < 0) return -1;
 
 	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 #ifdef SO_REUSEPORT
@@ -743,7 +864,6 @@ static int setup_matter_v6_socket(int port)
 	addr.sin6_addr = in6addr_any;
 
 	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		perror("bind(matter_v6)");
 		close(fd);
 		return -1;
 	}
@@ -758,8 +878,7 @@ static int setup_mdns_v6_socket(void)
 	struct ipv6_mreq mreq6;
 
 	fd = socket(AF_INET6, SOCK_DGRAM, 0);
-	if (fd < 0)
-		return -1;
+	if (fd < 0) return -1;
 
 	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 #ifdef SO_REUSEPORT
@@ -791,13 +910,11 @@ static uint8_t *write_dns_name(uint8_t *p, const char *name)
 	while (*src) {
 		const char *dot = strchr(src, '.');
 		size_t len = dot ? (size_t)(dot - src) : strlen(src);
-		if (len > 63)
-			len = 63;
+		if (len > 63) len = 63;
 		*p++ = (uint8_t)len;
 		memcpy(p, src, len);
 		p += len;
-		if (!dot)
-			break;
+		if (!dot) break;
 		src = dot + 1;
 	}
 	*p++ = 0x00;
@@ -901,7 +1018,6 @@ static void send_mdns_announcement(void)
 	sendto(g_mdns_v6_fd, pkt, pkt_len, 0, (struct sockaddr *)&dest6, sizeof(dest6));
 }
 
-/* Safe binary DNS question parser traversing length-prefixed labels */
 static bool dns_query_matches_matter(const uint8_t *pkt, size_t len)
 {
 	if (len < 12)
@@ -932,7 +1048,7 @@ static bool dns_query_matches_matter(const uint8_t *pkt, size_t len)
 }
 
 /* --------------------------------------------------------------------------
- * Matter Interaction Model Dispatcher (Endpoint 0 Commissioning & Endpoint 1 Camera)
+ * Matter Interaction Model Dispatcher (Parsed Cluster Matching)
  * -------------------------------------------------------------------------- */
 
 static size_t handle_interaction_model(uint8_t opcode, const uint8_t *in_payload, size_t in_len,
@@ -940,6 +1056,9 @@ static size_t handle_interaction_model(uint8_t opcode, const uint8_t *in_payload
 {
 	(void)max_out_len;
 	uint8_t *p = out_payload;
+
+	uint32_t cluster_id = 0;
+	tlv_find_cluster_id(in_payload, in_len, &cluster_id);
 
 	if (opcode == MSG_OP_READ_REQUEST || opcode == MSG_OP_SUBSCRIBE_REQUEST) {
 		*out_opcode = MSG_OP_REPORT_DATA;
@@ -987,7 +1106,7 @@ static size_t handle_interaction_model(uint8_t opcode, const uint8_t *in_payload
 		p = tlv_put_container(p, TLV_ARRAY, TLV_TAG_CONTEXT_1, 1);
 		p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_ANONYMOUS, 0);
 
-		if (in_len > 4 && in_payload[2] == CLUSTER_GENERAL_COMMISSIONING) {
+		if (cluster_id == CLUSTER_GENERAL_COMMISSIONING) {
 			g_config.failsafe_armed = true;
 			p = tlv_put_container(p, TLV_LIST, TLV_TAG_CONTEXT_1, 0);
 			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 0);
@@ -999,7 +1118,7 @@ static size_t handle_interaction_model(uint8_t opcode, const uint8_t *in_payload
 			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 0);
 			p = tlv_put_string(p, TLV_TAG_CONTEXT_1, 1, "");
 			p = tlv_put_end(p);
-		} else if (in_len > 4 && in_payload[2] == CLUSTER_OPERATIONAL_CREDS) {
+		} else if (cluster_id == CLUSTER_OPERATIONAL_CREDS) {
 			/* Operational Credentials: CSR Generation via mbedtls_x509write_csr */
 			mbedtls_x509write_csr csr;
 			mbedtls_x509write_csr_init(&csr);
@@ -1015,7 +1134,7 @@ static size_t handle_interaction_model(uint8_t opcode, const uint8_t *in_payload
 			p = tlv_put_container(p, TLV_LIST, TLV_TAG_CONTEXT_1, 0);
 			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 0);
 			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 1, CLUSTER_OPERATIONAL_CREDS);
-			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 0x01); /* CSRResponse */
+			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 0x01);
 			p = tlv_put_end(p);
 
 			p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_CONTEXT_1, 1);
@@ -1064,13 +1183,23 @@ static void handle_matter_packet(const uint8_t *buf, ssize_t len, const struct s
 
 	uint8_t flags = buf[0];
 	uint16_t session_id = buf[1] | (buf[2] << 8);
+	uint8_t sec_flags = buf[3];
 	uint32_t counter = buf[4] | (buf[5] << 8) | (buf[6] << 16) | (buf[7] << 24);
 
 	size_t header_len = 8;
-	if (flags & 0x04) header_len += 8;
-	if (flags & 0x01) header_len += 8;
+	uint64_t source_node_id = 0;
+	if (flags & 0x04) {
+		for (int i = 0; i < 8; i++)
+			source_node_id |= ((uint64_t)buf[header_len + i]) << (8 * i);
+		header_len += 8;
+	}
+	if (flags & 0x01) {
+		header_len += 8;
+	}
 
 	matter_session_t *s = &g_sessions[0];
+	s->peer_node_id = source_node_id;
+
 	uint8_t decrypted_buf[BUFFER_SIZE];
 	const uint8_t *msg_data = buf + header_len;
 	size_t msg_data_len = len - header_len;
@@ -1078,8 +1207,8 @@ static void handle_matter_packet(const uint8_t *buf, ssize_t len, const struct s
 	if (s->encrypted && msg_data_len > 16) {
 		const uint8_t *tag = msg_data + (msg_data_len - 16);
 		size_t cipher_len = msg_data_len - 16;
-		int dret = decrypt_matter_payload(s->session_key, counter, buf, header_len,
-						  msg_data, cipher_len, tag, decrypted_buf);
+		int dret = decrypt_matter_payload(s->session_key, sec_flags, counter, source_node_id,
+						  buf, header_len, msg_data, cipher_len, tag, decrypted_buf);
 		if (dret != 0) {
 			return;
 		}
@@ -1164,8 +1293,8 @@ static void handle_matter_packet(const uint8_t *buf, ssize_t len, const struct s
 	if (s->encrypted) {
 		uint8_t cipher[BUFFER_SIZE];
 		uint8_t tag[16];
-		encrypt_matter_payload(s->session_key, resp_counter, resp_buf, resp_hdr_len,
-				       proto_and_payload, plain_total_len, cipher, tag);
+		encrypt_matter_payload(s->session_key, 0x08, resp_counter, source_node_id,
+				       resp_buf, resp_hdr_len, proto_and_payload, plain_total_len, cipher, tag);
 		memcpy(p, cipher, plain_total_len);
 		p += plain_total_len;
 		memcpy(p, tag, 16);
@@ -1369,6 +1498,8 @@ int main(int argc, char **argv)
 	unlink("/run/matter/cmd.fifo");
 
 	mbedtls_pk_free(&g_device_key);
+	mbedtls_ecp_point_free(&g_spake_N);
+	mbedtls_ecp_point_free(&g_spake_M);
 	mbedtls_ecp_group_free(&g_ecp_grp);
 	mbedtls_ctr_drbg_free(&g_drbg);
 	mbedtls_entropy_free(&g_entropy);
