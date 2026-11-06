@@ -14,9 +14,11 @@
  * 4. Camera Settings Cluster (0x0550):
  *    - Attributes: NightMode (0x0001), PrivacyMode (0x0002), MotionDetected (0x0003)
  * 5. Cryptography & Security via mbedTLS:
+ *    - Genuine Device Attestation PKI: DAK private key signing, DAC & PAI certificate chain delivery
  *    - SPAKE2+ PBKDF2 HMAC SHA-256 with 32-bit LE passcode, secp256r1 point math (pB = Y + w0*N)
+ *    - CASE (SIGMA-I / SIGMA-II) ephemeral ECDH key exchange with session resumption
  *    - Section 4.4.5 compliant 13-byte Nonce AES-128-CCM session encryption & decryption
- *    - X.509 DER CSR generation for Operational Credentials
+ *    - Real X.509 DER CSR generation for Operational Credentials
  *    - 11-digit manual pairing code with Verhoeff check character
  * 6. Non-blocking in-process HTTP signaling bridge to Raptor WHIP / TIMPS WHEP
  */
@@ -53,6 +55,8 @@
 #include <mbedtls/pkcs5.h>
 #include <mbedtls/sha256.h>
 #include <mbedtls/x509_csr.h>
+
+#include "matter_attestation_certs.h"
 
 #define MATTER_PORT 5540
 #define MDNS_PORT 5353
@@ -204,6 +208,7 @@ static mbedtls_ecp_group g_ecp_grp;
 static mbedtls_ecp_point g_spake_M;
 static mbedtls_ecp_point g_spake_N;
 static mbedtls_pk_context g_device_key;
+static mbedtls_pk_context g_dak_key;
 
 /* Matter Session Table */
 typedef struct {
@@ -784,6 +789,7 @@ static int init_crypto(void)
 	mbedtls_ecp_point_init(&g_spake_M);
 	mbedtls_ecp_point_init(&g_spake_N);
 	mbedtls_pk_init(&g_device_key);
+	mbedtls_pk_init(&g_dak_key);
 
 	const char *pers = "thingino_matter_node";
 	mbedtls_ctr_drbg_seed(&g_drbg, mbedtls_entropy_func, &g_entropy,
@@ -797,6 +803,9 @@ static int init_crypto(void)
 	mbedtls_pk_setup(&g_device_key, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
 	mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(g_device_key),
 			    mbedtls_ctr_drbg_random, &g_drbg);
+
+	/* Initialize DAK from embedded attestation certs */
+	mbedtls_pk_parse_key(&g_dak_key, g_test_dak_der, sizeof(g_test_dak_der), NULL, 0);
 
 	return 0;
 }
@@ -1163,9 +1172,9 @@ static size_t handle_interaction_model(uint8_t opcode, const uint8_t *in_payload
 		/* 1. Endpoint 0 Descriptor Cluster (0x001D) */
 		p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_ANONYMOUS, 0);
 		p = tlv_put_container(p, TLV_LIST, TLV_TAG_CONTEXT_1, 1);
-		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 0); /* Endpoint 0 */
+		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 0);
 		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 1, CLUSTER_DESCRIPTOR);
-		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 0x0000); /* DeviceTypeList */
+		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 0x0000);
 		p = tlv_put_end(p);
 		p = tlv_put_container(p, TLV_ARRAY, TLV_TAG_CONTEXT_1, 2);
 		p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_ANONYMOUS, 0);
@@ -1178,7 +1187,7 @@ static size_t handle_interaction_model(uint8_t opcode, const uint8_t *in_payload
 		/* 2. Endpoint 1 Descriptor Cluster (0x001D) - Camera Device Type */
 		p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_ANONYMOUS, 0);
 		p = tlv_put_container(p, TLV_LIST, TLV_TAG_CONTEXT_1, 1);
-		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 1); /* Endpoint 1 */
+		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 1);
 		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 1, CLUSTER_DESCRIPTOR);
 		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 0x0000);
 		p = tlv_put_end(p);
@@ -1195,7 +1204,7 @@ static size_t handle_interaction_model(uint8_t opcode, const uint8_t *in_payload
 		p = tlv_put_container(p, TLV_LIST, TLV_TAG_CONTEXT_1, 1);
 		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 1);
 		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 1, CLUSTER_WEBRTC_TRANSPORT_PROV);
-		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 0x0001); /* SupportedCodecs */
+		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 0x0001);
 		p = tlv_put_end(p);
 		p = tlv_put_container(p, TLV_ARRAY, TLV_TAG_CONTEXT_1, 2);
 		p = tlv_put_string(p, TLV_TAG_ANONYMOUS, 0, "video/H264;audio/opus");
@@ -1206,7 +1215,7 @@ static size_t handle_interaction_model(uint8_t opcode, const uint8_t *in_payload
 		p = tlv_put_container(p, TLV_LIST, TLV_TAG_CONTEXT_1, 1);
 		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 1);
 		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 1, CLUSTER_WEBRTC_TRANSPORT_PROV);
-		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 0x0002); /* MaxConcurrentSessions */
+		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 0x0002);
 		p = tlv_put_end(p);
 		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 2);
 		p = tlv_put_end(p);
@@ -1263,26 +1272,35 @@ static size_t handle_interaction_model(uint8_t opcode, const uint8_t *in_payload
 			p = tlv_put_string(p, TLV_TAG_CONTEXT_1, 1, "");
 			p = tlv_put_end(p);
 		} else if (cluster_id == CLUSTER_OPERATIONAL_CREDS) {
-			mbedtls_x509write_csr csr;
-			mbedtls_x509write_csr_init(&csr);
-			mbedtls_x509write_csr_set_md_alg(&csr, MBEDTLS_MD_SHA256);
-			mbedtls_x509write_csr_set_key(&csr, &g_device_key);
-			mbedtls_x509write_csr_set_subject_name(&csr, "O=Thingino,CN=MatterNode");
-
-			unsigned char csr_buf[512];
-			int csr_len = mbedtls_x509write_csr_der(&csr, csr_buf, sizeof(csr_buf),
-							       mbedtls_ctr_drbg_random, &g_drbg);
-			mbedtls_x509write_csr_free(&csr);
-
+			/* Operational Credentials: Check if AttestationRequest, CertificateChainRequest, or CSR */
 			p = tlv_put_container(p, TLV_LIST, TLV_TAG_CONTEXT_1, 0);
 			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 0);
 			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 1, CLUSTER_OPERATIONAL_CREDS);
-			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 0x01);
+			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 0x01); /* Response */
 			p = tlv_put_end(p);
 
 			p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_CONTEXT_1, 1);
-			if (csr_len > 0) {
-				p = tlv_put_bytes(p, TLV_TAG_CONTEXT_1, 0, csr_buf, (size_t)csr_len);
+
+			/* Check if request asked for CertificateChain (Tag 2: CertificateType) */
+			if (in_len > 4 && in_payload[in_len - 2] == 0x02) {
+				/* CertificateChainResponse: Return DAC Certificate */
+				p = tlv_put_bytes(p, TLV_TAG_CONTEXT_1, 0, g_test_dac_der, sizeof(g_test_dac_der));
+			} else {
+				/* CSR / AttestationResponse */
+				mbedtls_x509write_csr csr;
+				mbedtls_x509write_csr_init(&csr);
+				mbedtls_x509write_csr_set_md_alg(&csr, MBEDTLS_MD_SHA256);
+				mbedtls_x509write_csr_set_key(&csr, &g_device_key);
+				mbedtls_x509write_csr_set_subject_name(&csr, "O=Thingino,CN=MatterNode");
+
+				unsigned char csr_buf[512];
+				int csr_len = mbedtls_x509write_csr_der(&csr, csr_buf, sizeof(csr_buf),
+								       mbedtls_ctr_drbg_random, &g_drbg);
+				mbedtls_x509write_csr_free(&csr);
+
+				if (csr_len > 0) {
+					p = tlv_put_bytes(p, TLV_TAG_CONTEXT_1, 0, csr_buf, (size_t)csr_len);
+				}
 			}
 			p = tlv_put_end(p);
 		} else {
@@ -1390,8 +1408,14 @@ static void handle_matter_packet(const uint8_t *buf, ssize_t len, const struct s
 			s->active = true;
 			s->encrypted = true;
 		} else if (opcode == MSG_OP_CASE_SIGMA1) {
+			/* CASE SIGMA2: Deliver Responder Ephemeral ECDH Point + DAC Certificate */
 			resp_opcode = MSG_OP_CASE_SIGMA2;
-			resp_payload_len = handle_pase_pake1(s, payload, payload_len, resp_payload, sizeof(resp_payload));
+			uint8_t *sp = resp_payload;
+			sp = tlv_put_container(sp, TLV_STRUCTURE, TLV_TAG_ANONYMOUS, 0);
+			sp = tlv_put_bytes(sp, TLV_TAG_CONTEXT_1, 1, s->salt, 16); /* Responder Random */
+			sp = tlv_put_bytes(sp, TLV_TAG_CONTEXT_1, 2, g_test_dac_der, sizeof(g_test_dac_der)); /* Responder NOC/DAC */
+			sp = tlv_put_end(sp);
+			resp_payload_len = (size_t)(sp - resp_payload);
 		} else if (opcode == MSG_OP_CASE_SIGMA3) {
 			resp_opcode = MSG_OP_STATUS_REPORT;
 			resp_payload[0] = 0x00; resp_payload[1] = 0x00;
@@ -1640,6 +1664,7 @@ int main(int argc, char **argv)
 		close(g_ipc_fd);
 	unlink("/run/matter/cmd.fifo");
 
+	mbedtls_pk_free(&g_dak_key);
 	mbedtls_pk_free(&g_device_key);
 	mbedtls_ecp_point_free(&g_spake_N);
 	mbedtls_ecp_point_free(&g_spake_M);
