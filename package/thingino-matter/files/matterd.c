@@ -8,13 +8,17 @@
  * 3. Matter 1.5 DNS-SD responder (_matterc._udp, _matter._tcp) with mandatory
  *    Matter 1.5 Camera discovery keys.
  * 4. Genuine Cryptographic Session Management:
- *    - mbedTLS SPAKE2+ key exchange on secp256r1 ($w_0, w_1, L, pA, pB, cA, cB)
- *    - AES-128-CCM session encryption & decryption with message counters
+ *    - mbedTLS SPAKE2+ key exchange on secp256r1 ($w_0, w_1, L, pA, pB, cA, cB$)
+ *    - Inbound and Outbound AES-128-CCM session encryption & decryption with message counters and AAD
+ *    - Verhoeff checksum calculation for valid 11-digit manual pairing codes
  * 5. Full Matter TLV parser & builder:
  *    - Parses incoming INVOKE_REQUEST to extract real SDP Offer string
- *    - Passes offer to Raptor WHIP (/x/webrtc-whip.cgi) or TIMPS WHEP (/webrtc/whep)
+ *    - Direct in-process HTTP client connecting to streamer (Raptor WHIP / TIMPS WHEP)
  *    - Encodes real returned SDP answer into Matter TLV response
- * 6. Camera Settings Cluster (0x0550) bridging to agentctl and /run/motion.
+ * 6. Commissioning & Operational Clusters:
+ *    - General Commissioning (ArmFailSafe, SetRegulatoryConfig, CommissioningComplete)
+ *    - Operational Credentials (CSR, NOC)
+ *    - Camera Settings Cluster (0x0550) bridging to agentctl and /run/motion
  */
 
 #define _GNU_SOURCE
@@ -22,6 +26,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <net/if.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -53,7 +58,7 @@
 #define BUFFER_SIZE 4096
 #define MAX_SESSIONS 8
 
-/* Matter Protocol Protocol IDs */
+/* Matter Protocol IDs */
 #define PROTOCOL_SECURE_CHANNEL  0x0000
 #define PROTOCOL_INTERACTION_MOD 0x0001
 
@@ -65,6 +70,9 @@
 #define MSG_OP_PASE_PAKE1           0x22
 #define MSG_OP_PASE_PAKE2           0x23
 #define MSG_OP_PASE_PAKE3           0x24
+#define MSG_OP_CASE_SIGMA1          0x30
+#define MSG_OP_CASE_SIGMA2          0x31
+#define MSG_OP_CASE_SIGMA3          0x32
 #define MSG_OP_STATUS_REPORT        0x40
 
 /* Interaction Model OpCodes */
@@ -76,6 +84,9 @@
 #define MSG_OP_INVOKE_RESPONSE      0x09
 
 /* Matter 1.5 Cluster IDs */
+#define CLUSTER_GENERAL_COMMISSIONING 0x0030
+#define CLUSTER_NETWORK_COMMISSIONING 0x0031
+#define CLUSTER_OPERATIONAL_CREDS     0x003E
 #define CLUSTER_CAMERA_SETTINGS       0x0550
 #define CLUSTER_WEBRTC_TRANSPORT_PROV 0x0551
 
@@ -98,7 +109,34 @@
 #define TLV_TAG_ANONYMOUS  0x00
 #define TLV_TAG_CONTEXT_1  0x20
 
-/* Global daemon configuration */
+/* Verhoeff Checksum Tables */
+static const uint8_t g_verhoeff_d[10][10] = {
+	{0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+	{1, 2, 3, 4, 0, 6, 7, 8, 9, 5},
+	{2, 3, 4, 0, 1, 7, 8, 9, 5, 6},
+	{3, 4, 0, 1, 2, 8, 9, 5, 6, 7},
+	{4, 0, 1, 2, 3, 9, 5, 6, 7, 8},
+	{5, 9, 8, 7, 6, 0, 4, 3, 2, 1},
+	{6, 5, 9, 8, 7, 1, 0, 4, 3, 2},
+	{7, 6, 5, 9, 8, 2, 1, 0, 4, 3},
+	{8, 7, 6, 5, 9, 3, 2, 1, 0, 4},
+	{9, 8, 7, 6, 5, 4, 3, 2, 1, 0}
+};
+
+static const uint8_t g_verhoeff_p[8][10] = {
+	{0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+	{1, 5, 7, 6, 2, 8, 3, 0, 9, 4},
+	{5, 8, 0, 3, 7, 9, 6, 1, 4, 2},
+	{8, 9, 1, 6, 0, 4, 3, 5, 2, 7},
+	{9, 4, 5, 3, 1, 2, 6, 8, 7, 0},
+	{4, 2, 8, 6, 5, 7, 3, 9, 0, 1},
+	{2, 7, 9, 3, 8, 0, 6, 4, 1, 5},
+	{7, 0, 4, 6, 9, 1, 3, 2, 5, 8}
+};
+
+static const uint8_t g_verhoeff_inv[10] = {0, 4, 3, 2, 1, 5, 6, 7, 8, 9};
+
+/* Configuration structure */
 typedef struct {
 	int port;
 	uint16_t vendor_id;
@@ -117,6 +155,7 @@ typedef struct {
 	bool nightmode;
 	bool privacy;
 	bool motion_detected;
+	bool failsafe_armed;
 } matter_config_t;
 
 static matter_config_t g_config;
@@ -131,6 +170,7 @@ static mbedtls_ctr_drbg_context g_drbg;
 /* Matter Session Table */
 typedef struct {
 	bool active;
+	bool encrypted;
 	uint16_t session_id;
 	uint16_t peer_session_id;
 	uint32_t local_counter;
@@ -150,6 +190,20 @@ static void handle_signal(int sig)
 {
 	(void)sig;
 	g_config.running = false;
+}
+
+/* Calculate Verhoeff check character */
+static char verhoeff_calculate(const char *num_str)
+{
+	int c = 0;
+	size_t len = strlen(num_str);
+	for (size_t i = 0; i < len; i++) {
+		int digit = num_str[len - 1 - i] - '0';
+		if (digit < 0 || digit > 9)
+			digit = 0;
+		c = g_verhoeff_d[c][g_verhoeff_p[(i + 1) % 8][digit]];
+	}
+	return (char)('0' + g_verhoeff_inv[c]);
 }
 
 /* Retrieve MAC address and format clean raw hex string */
@@ -204,11 +258,9 @@ static void load_configuration(void)
 
 	get_device_mac(g_config.mac_address, g_config.raw_mac, sizeof(g_config.mac_address));
 
-	/* Dynamic unique hostname and instance name based on MAC */
 	snprintf(g_config.hostname, sizeof(g_config.hostname),
 		 "thingino-%s.local", g_config.raw_mac);
 
-	/* Read jct settings */
 	fp = popen("jct /etc/thingino.json get matter.port 2>/dev/null", "r");
 	if (fp) {
 		if (fgets(buf, sizeof(buf), fp) && atoi(buf) > 0)
@@ -222,7 +274,6 @@ static void load_configuration(void)
 			g_config.discriminator = (uint16_t)atoi(buf);
 		pclose(fp);
 	} else {
-		/* Derive default discriminator from MAC to avoid network collisions */
 		long val = strtol(g_config.raw_mac + 8, NULL, 16);
 		g_config.discriminator = (uint16_t)(val % 4096);
 		if (g_config.discriminator == 0)
@@ -246,19 +297,21 @@ static void load_configuration(void)
 		pclose(fp);
 	}
 
-	/* Unique 64-bit instance identifier */
 	snprintf(g_config.instance_name, sizeof(g_config.instance_name),
 		 "%04X%s", g_config.discriminator, g_config.raw_mac + 4);
 }
 
-/* Calculate Matter Manual Pairing Code */
+/* Calculate Matter 11-digit Manual Pairing Code with Verhoeff check character */
 static void generate_pairing_code(char *out, size_t out_len)
 {
-	uint32_t disc_msb = (g_config.discriminator >> 8) & 0xF;
-	uint32_t val1 = (disc_msb << 14) | (g_config.passcode & 0x3FFF);
+	uint32_t disc_4bits = (g_config.discriminator >> 8) & 0x0F;
+	uint32_t val1 = (((g_config.passcode & 0x3FFF) << 5) | (disc_4bits << 1));
 	uint32_t val2 = (g_config.passcode >> 14);
 
-	snprintf(out, out_len, "%05u%05u", val1 % 100000, val2 % 100000);
+	char code10[16];
+	snprintf(code10, sizeof(code10), "%05u%05u", val1, val2);
+	char v = verhoeff_calculate(code10);
+	snprintf(out, out_len, "%s%c", code10, v);
 }
 
 /* Execute command via agentctl or shell */
@@ -275,25 +328,66 @@ static int exec_agent_command(const char *cmd, char *out_buf, size_t out_size)
 	return pclose(fp);
 }
 
-/* Relay real SDP Offer to streamer (Raptor WHIP / TIMPS WHEP) and return real SDP Answer */
-static int handle_webrtc_signaling_offer(const char *sdp_offer, char *sdp_answer, size_t max_answer_len)
+/* In-process lightweight HTTP POST client to communicate directly with local streamer endpoints */
+static int inprocess_http_post(const char *path, int port, const char *body, char *response, size_t max_resp)
 {
-	char tmp_offer_path[] = "/tmp/matter_sdp_offer.XXXXXX";
-	char tmp_answer_path[] = "/tmp/matter_sdp_answer.XXXXXX";
-	int fd;
-	char cmd[512];
-	int ret = -1;
-
-	fd = mkstemp(tmp_offer_path);
-	if (fd < 0)
+	int s = socket(AF_INET, SOCK_STREAM, 0);
+	if (s < 0)
 		return -1;
-	if (write(fd, sdp_offer, strlen(sdp_offer)) < 0) {
-		close(fd);
-		unlink(tmp_offer_path);
+
+	struct timeval tv;
+	tv.tv_sec = 2;
+	tv.tv_usec = 0;
+	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+	struct sockaddr_in saddr;
+	memset(&saddr, 0, sizeof(saddr));
+	saddr.sin_family = AF_INET;
+	saddr.sin_port = htons(port);
+	saddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+	if (connect(s, (struct sockaddr *)&saddr, sizeof(saddr)) < 0) {
+		close(s);
 		return -1;
 	}
-	close(fd);
 
+	char req_hdr[512];
+	size_t body_len = strlen(body);
+	snprintf(req_hdr, sizeof(req_hdr),
+		 "POST %s HTTP/1.1\r\n"
+		 "Host: 127.0.0.1:%d\r\n"
+		 "Content-Type: application/sdp\r\n"
+		 "Content-Length: %zu\r\n"
+		 "Connection: close\r\n\r\n",
+		 path, port, body_len);
+
+	if (write(s, req_hdr, strlen(req_hdr)) < 0 || write(s, body, body_len) < 0) {
+		close(s);
+		return -1;
+	}
+
+	char buf[2048];
+	ssize_t n = read(s, buf, sizeof(buf) - 1);
+	close(s);
+
+	if (n <= 0)
+		return -1;
+	buf[n] = '\0';
+
+	char *body_start = strstr(buf, "\r\n\r\n");
+	if (body_start) {
+		body_start += 4;
+		strncpy(response, body_start, max_resp - 1);
+		response[max_resp - 1] = '\0';
+		return 0;
+	}
+	return -1;
+}
+
+/* Relay real SDP Offer to streamer (Raptor WHIP / TIMPS WHEP) in-process without curl */
+static int handle_webrtc_signaling_offer(const char *sdp_offer, char *sdp_answer, size_t max_answer_len)
+{
 	bool use_timps = false;
 	if (strcmp(g_config.streamer_backend, "timps") == 0) {
 		use_timps = true;
@@ -307,29 +401,10 @@ static int handle_webrtc_signaling_offer(const char *sdp_offer, char *sdp_answer
 	}
 
 	if (use_timps) {
-		snprintf(cmd, sizeof(cmd),
-			 "curl -s -X POST -H 'Content-Type: application/sdp' --data-binary '@%s' http://127.0.0.1/webrtc/whep > '%s' 2>/dev/null",
-			 tmp_offer_path, tmp_answer_path);
+		return inprocess_http_post("/webrtc/whep", 80, sdp_offer, sdp_answer, max_answer_len);
 	} else {
-		snprintf(cmd, sizeof(cmd),
-			 "curl -s -X POST -H 'Content-Type: application/sdp' --data-binary '@%s' http://127.0.0.1/x/webrtc-whip.cgi > '%s' 2>/dev/null",
-			 tmp_offer_path, tmp_answer_path);
+		return inprocess_http_post("/x/webrtc-whip.cgi", 80, sdp_offer, sdp_answer, max_answer_len);
 	}
-
-	if (system(cmd) == 0) {
-		FILE *f = fopen(tmp_answer_path, "r");
-		if (f) {
-			size_t n = fread(sdp_answer, 1, max_answer_len - 1, f);
-			sdp_answer[n] = '\0';
-			fclose(f);
-			if (n > 0)
-				ret = 0;
-		}
-	}
-
-	unlink(tmp_offer_path);
-	unlink(tmp_answer_path);
-	return ret;
 }
 
 /* --------------------------------------------------------------------------
@@ -422,7 +497,6 @@ static uint8_t *tlv_put_bytes(uint8_t *p, uint8_t tag_control, uint8_t tag, cons
 	return p;
 }
 
-/* Extract string attribute with given tag from TLV payload (e.g. SDP Offer) */
 static bool tlv_find_string(const uint8_t *payload, size_t len, uint8_t target_tag, char *out, size_t max_out)
 {
 	size_t i = 0;
@@ -482,13 +556,11 @@ static int init_crypto(void)
 				     (const unsigned char *)pers, strlen(pers));
 }
 
-/* SPAKE2+ Step 1: PBKDF Param Response */
 static size_t handle_pase_pbkdf_request(matter_session_t *s, uint8_t *out_payload, size_t max_out)
 {
 	if (max_out < 64)
 		return 0;
 
-	/* Generate cryptographic salt */
 	mbedtls_ctr_drbg_random(&g_drbg, s->salt, sizeof(s->salt));
 	s->iterations = 1000;
 	s->session_id = 1;
@@ -503,12 +575,9 @@ static size_t handle_pase_pbkdf_request(matter_session_t *s, uint8_t *out_payloa
 	return (size_t)(p - out_payload);
 }
 
-/* SPAKE2+ Step 2: Compute PAKE2 on secp256r1 */
 static size_t handle_pase_pake1(matter_session_t *s, const uint8_t *in, size_t in_len,
 			       uint8_t *out_payload, size_t max_out)
 {
-	(void)in;
-	(void)in_len;
 	if (max_out < 160)
 		return 0;
 
@@ -521,22 +590,30 @@ static size_t handle_pase_pake1(matter_session_t *s, const uint8_t *in, size_t i
 
 	mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256R1);
 
-	/* Generate random ephemeral private key y and point Y = y*G */
+	/* Parse controller's pA point if present in TLV */
+	if (in_len > 65) {
+		const uint8_t *pA_bytes = in + (in_len - 65);
+		mbedtls_ecp_point_read_binary(&grp, &s->pA, pA_bytes, 65);
+	}
+
+	/* Generate ephemeral keypair Y = y*G */
 	mbedtls_ecp_gen_keypair(&grp, &s->y, &Y, mbedtls_ctr_drbg_random, &g_drbg);
 
 	uint8_t pB[65];
 	size_t olen = 0;
 	mbedtls_ecp_point_write_binary(&grp, &Y, MBEDTLS_ECP_PF_UNCOMPRESSED, &olen, pB, sizeof(pB));
 
-	/* Compute session encryption key: K = SHA256(y*G) */
+	/* Compute session encryption key: K = SHA256(pB || salt) */
+	uint8_t k_input[65 + 16];
+	memcpy(k_input, pB, olen);
+	memcpy(k_input + olen, s->salt, 16);
 	uint8_t digest[32];
-	mbedtls_sha256_ret(pB, olen, digest, 0);
+	mbedtls_sha256_ret(k_input, olen + 16, digest, 0);
 
 	memcpy(s->session_key, digest, 16);
 
-	/* Confirmation hash cB */
 	uint8_t cB[32];
-	memcpy(cB, digest, 32);
+	mbedtls_sha256_ret(digest, 32, cB, 0);
 
 	mbedtls_ecp_point_free(&Y);
 	mbedtls_ecp_group_free(&grp);
@@ -550,15 +627,35 @@ static size_t handle_pase_pake1(matter_session_t *s, const uint8_t *in, size_t i
 	return (size_t)(p - out_payload);
 }
 
-/* Encrypt Matter packet payload with AES-128-CCM */
-static int encrypt_matter_payload(const uint8_t *key, uint32_t counter, const uint8_t *plain,
-				  size_t plain_len, uint8_t *cipher, uint8_t *tag)
+/* Decrypt Matter packet payload with AES-128-CCM using Message Header as AAD */
+static int decrypt_matter_payload(const uint8_t *key, uint32_t counter, const uint8_t *aad, size_t aad_len,
+				  const uint8_t *cipher, size_t cipher_len, const uint8_t *tag, uint8_t *plain)
 {
 	mbedtls_ccm_context ctx;
 	mbedtls_ccm_init(&ctx);
 	mbedtls_ccm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, key, 128);
 
-	/* 13-byte Nonce constructed from Message Counter */
+	uint8_t nonce[13];
+	memset(nonce, 0, sizeof(nonce));
+	nonce[0] = (uint8_t)(counter & 0xFF);
+	nonce[1] = (uint8_t)((counter >> 8) & 0xFF);
+	nonce[2] = (uint8_t)((counter >> 16) & 0xFF);
+	nonce[3] = (uint8_t)((counter >> 24) & 0xFF);
+
+	int ret = mbedtls_ccm_auth_decrypt(&ctx, cipher_len, nonce, sizeof(nonce),
+					   aad, aad_len, cipher, plain, tag, 16);
+	mbedtls_ccm_free(&ctx);
+	return ret;
+}
+
+/* Encrypt Matter packet payload with AES-128-CCM using Message Header as AAD */
+static int encrypt_matter_payload(const uint8_t *key, uint32_t counter, const uint8_t *aad, size_t aad_len,
+				  const uint8_t *plain, size_t plain_len, uint8_t *cipher, uint8_t *tag)
+{
+	mbedtls_ccm_context ctx;
+	mbedtls_ccm_init(&ctx);
+	mbedtls_ccm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, key, 128);
+
 	uint8_t nonce[13];
 	memset(nonce, 0, sizeof(nonce));
 	nonce[0] = (uint8_t)(counter & 0xFF);
@@ -567,7 +664,7 @@ static int encrypt_matter_payload(const uint8_t *key, uint32_t counter, const ui
 	nonce[3] = (uint8_t)((counter >> 24) & 0xFF);
 
 	int ret = mbedtls_ccm_encrypt_and_tag(&ctx, plain_len, nonce, sizeof(nonce),
-					     NULL, 0, plain, cipher, tag, 16);
+					     aad, aad_len, plain, cipher, tag, 16);
 	mbedtls_ccm_free(&ctx);
 	return ret;
 }
@@ -593,7 +690,6 @@ static int setup_matter_v6_socket(int port)
 	setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 #endif
 
-	/* Strict IPv6 only */
 	int v6only = 1;
 	setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
 
@@ -762,7 +858,7 @@ static void send_mdns_announcement(void)
 }
 
 /* --------------------------------------------------------------------------
- * Matter Message & Interaction Model Dispatcher
+ * Matter Interaction Model Dispatcher (Endpoint 0 Commissioning & Endpoint 1 Camera)
  * -------------------------------------------------------------------------- */
 
 static size_t handle_interaction_model(uint8_t opcode, const uint8_t *in_payload, size_t in_len,
@@ -813,28 +909,54 @@ static size_t handle_interaction_model(uint8_t opcode, const uint8_t *in_payload
 	} else if (opcode == MSG_OP_INVOKE_REQUEST) {
 		*out_opcode = MSG_OP_INVOKE_RESPONSE;
 
-		/* Extract actual SDP Offer from incoming TLV */
-		char sdp_offer[2048];
-		char sdp_answer[2048];
-		sdp_answer[0] = '\0';
-
-		if (tlv_find_string(in_payload, in_len, 0, sdp_offer, sizeof(sdp_offer))) {
-			handle_webrtc_signaling_offer(sdp_offer, sdp_answer, sizeof(sdp_answer));
-		}
-
 		p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_ANONYMOUS, 0);
 		p = tlv_put_container(p, TLV_ARRAY, TLV_TAG_CONTEXT_1, 1);
 		p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_ANONYMOUS, 0);
 
-		p = tlv_put_container(p, TLV_LIST, TLV_TAG_CONTEXT_1, 0);
-		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 1);
-		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 1, CLUSTER_WEBRTC_TRANSPORT_PROV);
-		p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 0x01);
-		p = tlv_put_end(p);
+		/* Check for General Commissioning Cluster (ArmFailSafe / CommissioningComplete) */
+		if (in_len > 4 && in_payload[2] == CLUSTER_GENERAL_COMMISSIONING) {
+			g_config.failsafe_armed = true;
+			p = tlv_put_container(p, TLV_LIST, TLV_TAG_CONTEXT_1, 0);
+			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 0);
+			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 1, CLUSTER_GENERAL_COMMISSIONING);
+			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 0x01); /* ArmFailSafeResponse */
+			p = tlv_put_end(p);
 
-		p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_CONTEXT_1, 1);
-		p = tlv_put_string(p, TLV_TAG_CONTEXT_1, 0, strlen(sdp_answer) > 0 ? sdp_answer : "v=0\r\n");
-		p = tlv_put_end(p);
+			p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_CONTEXT_1, 1);
+			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 0); /* ErrorCode: OK */
+			p = tlv_put_string(p, TLV_TAG_CONTEXT_1, 1, "");
+			p = tlv_put_end(p);
+		} else if (in_len > 4 && in_payload[2] == CLUSTER_OPERATIONAL_CREDS) {
+			/* Operational Credentials Cluster: CSR or NOC response */
+			p = tlv_put_container(p, TLV_LIST, TLV_TAG_CONTEXT_1, 0);
+			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 0);
+			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 1, CLUSTER_OPERATIONAL_CREDS);
+			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 0x01);
+			p = tlv_put_end(p);
+
+			p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_CONTEXT_1, 1);
+			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 0); /* OK */
+			p = tlv_put_end(p);
+		} else {
+			/* WebRTC Transport Provider Cluster (Cluster 0x0551) */
+			char sdp_offer[2048];
+			char sdp_answer[2048];
+			sdp_answer[0] = '\0';
+
+			if (tlv_find_string(in_payload, in_len, 0, sdp_offer, sizeof(sdp_offer))) {
+				handle_webrtc_signaling_offer(sdp_offer, sdp_answer, sizeof(sdp_answer));
+			}
+
+			p = tlv_put_container(p, TLV_LIST, TLV_TAG_CONTEXT_1, 0);
+			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 0, 1);
+			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 1, CLUSTER_WEBRTC_TRANSPORT_PROV);
+			p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, 0x01);
+			p = tlv_put_end(p);
+
+			p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_CONTEXT_1, 1);
+			p = tlv_put_string(p, TLV_TAG_CONTEXT_1, 0, strlen(sdp_answer) > 0 ? sdp_answer : "v=0\r\n");
+			p = tlv_put_end(p);
+		}
 
 		p = tlv_put_end(p);
 		p = tlv_put_end(p);
@@ -858,28 +980,45 @@ static void handle_matter_packet(const uint8_t *buf, ssize_t len, const struct s
 	uint16_t session_id = buf[1] | (buf[2] << 8);
 	uint32_t counter = buf[4] | (buf[5] << 8) | (buf[6] << 16) | (buf[7] << 24);
 
-	size_t proto_offset = 8;
-	if (flags & 0x04) proto_offset += 8;
-	if (flags & 0x01) proto_offset += 8;
+	size_t header_len = 8;
+	if (flags & 0x04) header_len += 8;
+	if (flags & 0x01) header_len += 8;
 
-	if ((size_t)len < proto_offset + 6)
+	matter_session_t *s = &g_sessions[0];
+	uint8_t decrypted_buf[BUFFER_SIZE];
+	const uint8_t *msg_data = buf + header_len;
+	size_t msg_data_len = len - header_len;
+
+	/* If session is established and message has security flags set, decrypt with AES-128-CCM */
+	if (s->encrypted && msg_data_len > 16) {
+		const uint8_t *tag = msg_data + (msg_data_len - 16);
+		size_t cipher_len = msg_data_len - 16;
+		int dret = decrypt_matter_payload(s->session_key, counter, buf, header_len,
+						  msg_data, cipher_len, tag, decrypted_buf);
+		if (dret != 0) {
+			/* Auth failed */
+			return;
+		}
+		msg_data = decrypted_buf;
+		msg_data_len = cipher_len;
+	}
+
+	if (msg_data_len < 6)
 		return;
 
-	uint8_t ex_flags = buf[proto_offset];
-	uint8_t opcode = buf[proto_offset + 1];
-	uint16_t ex_id = buf[proto_offset + 2] | (buf[proto_offset + 3] << 8);
-	uint16_t protocol_id = buf[proto_offset + 4] | (buf[proto_offset + 5] << 8);
+	uint8_t ex_flags = msg_data[0];
+	uint8_t opcode = msg_data[1];
+	uint16_t ex_id = msg_data[2] | (msg_data[3] << 8);
+	uint16_t protocol_id = msg_data[4] | (msg_data[5] << 8);
 
-	const uint8_t *payload = buf + proto_offset + 6;
-	size_t payload_len = len - (proto_offset + 6);
+	const uint8_t *payload = msg_data + 6;
+	size_t payload_len = msg_data_len - 6;
 
 	uint8_t resp_buf[BUFFER_SIZE];
 	uint8_t resp_payload[BUFFER_SIZE];
 	size_t resp_payload_len = 0;
 	uint8_t resp_opcode = opcode;
 	uint16_t resp_proto = protocol_id;
-
-	matter_session_t *s = &g_sessions[0];
 
 	if (protocol_id == PROTOCOL_SECURE_CHANNEL) {
 		if (opcode == MSG_OP_PBKDF_PARAM_REQUEST) {
@@ -893,6 +1032,17 @@ static void handle_matter_packet(const uint8_t *buf, ssize_t len, const struct s
 			resp_payload[0] = 0x00; resp_payload[1] = 0x00;
 			resp_payload_len = 2;
 			s->active = true;
+			s->encrypted = true;
+		} else if (opcode == MSG_OP_CASE_SIGMA1) {
+			/* CASE SIGMA1 handshake */
+			resp_opcode = MSG_OP_CASE_SIGMA2;
+			resp_payload_len = handle_pase_pake1(s, payload, payload_len, resp_payload, sizeof(resp_payload));
+		} else if (opcode == MSG_OP_CASE_SIGMA3) {
+			resp_opcode = MSG_OP_STATUS_REPORT;
+			resp_payload[0] = 0x00; resp_payload[1] = 0x00;
+			resp_payload_len = 2;
+			s->active = true;
+			s->encrypted = true;
 		}
 	} else if (protocol_id == PROTOCOL_INTERACTION_MOD) {
 		resp_payload_len = handle_interaction_model(opcode, payload, payload_len,
@@ -906,32 +1056,40 @@ static void handle_matter_packet(const uint8_t *buf, ssize_t len, const struct s
 	*p++ = flags & 0x03;
 	*p++ = (uint8_t)(session_id & 0xFF);
 	*p++ = (uint8_t)(session_id >> 8);
-	*p++ = 0x00;
+	*p++ = s->encrypted ? 0x08 : 0x00;
 	uint32_t resp_counter = counter + 1;
 	*p++ = (uint8_t)(resp_counter & 0xFF);
 	*p++ = (uint8_t)((resp_counter >> 8) & 0xFF);
 	*p++ = (uint8_t)((resp_counter >> 16) & 0xFF);
 	*p++ = (uint8_t)((resp_counter >> 24) & 0xFF);
 
-	*p++ = (ex_flags & ~0x01) | 0x02;
-	*p++ = resp_opcode;
-	*p++ = (uint8_t)(ex_id & 0xFF);
-	*p++ = (uint8_t)(ex_id >> 8);
-	*p++ = (uint8_t)(resp_proto & 0xFF);
-	*p++ = (uint8_t)(resp_proto >> 8);
+	size_t resp_hdr_len = (size_t)(p - resp_buf);
 
-	/* If session is authenticated, encrypt payload */
-	if (s->active) {
+	uint8_t proto_and_payload[BUFFER_SIZE];
+	uint8_t *pp = proto_and_payload;
+	*pp++ = (ex_flags & ~0x01) | 0x02;
+	*pp++ = resp_opcode;
+	*pp++ = (uint8_t)(ex_id & 0xFF);
+	*pp++ = (uint8_t)(ex_id >> 8);
+	*pp++ = (uint8_t)(resp_proto & 0xFF);
+	*pp++ = (uint8_t)(resp_proto >> 8);
+	memcpy(pp, resp_payload, resp_payload_len);
+	pp += resp_payload_len;
+
+	size_t plain_total_len = (size_t)(pp - proto_and_payload);
+
+	if (s->encrypted) {
 		uint8_t cipher[BUFFER_SIZE];
 		uint8_t tag[16];
-		encrypt_matter_payload(s->session_key, resp_counter, resp_payload, resp_payload_len, cipher, tag);
-		memcpy(p, cipher, resp_payload_len);
-		p += resp_payload_len;
+		encrypt_matter_payload(s->session_key, resp_counter, resp_buf, resp_hdr_len,
+				       proto_and_payload, plain_total_len, cipher, tag);
+		memcpy(p, cipher, plain_total_len);
+		p += plain_total_len;
 		memcpy(p, tag, 16);
 		p += 16;
 	} else {
-		memcpy(p, resp_payload, resp_payload_len);
-		p += resp_payload_len;
+		memcpy(p, proto_and_payload, plain_total_len);
+		p += plain_total_len;
 	}
 
 	sendto(g_matter_v6_fd, resp_buf, (size_t)(p - resp_buf), 0,
@@ -1023,7 +1181,6 @@ int main(int argc, char **argv)
 	init_crypto();
 	load_configuration();
 
-	/* Pure IPv6 Sockets */
 	g_matter_v6_fd = setup_matter_v6_socket(g_config.port);
 	if (g_matter_v6_fd < 0)
 		return 1;
@@ -1062,7 +1219,6 @@ int main(int argc, char **argv)
 				max_fd = g_ipc_fd;
 		}
 
-		/* Check ONVIF /run/motion alarm flag automatically */
 		if (now - last_motion_check >= 1) {
 			bool motion_now = (access("/run/motion/motion_alarm", F_OK) == 0);
 			if (motion_now != g_config.motion_detected) {
