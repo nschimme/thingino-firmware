@@ -1,0 +1,15 @@
+{
+  "matter": {
+    "enabled": false,
+    "port": 5540,
+    "discriminator": 3840,
+    "passcode": 20202021,
+    "vendor_id": 65521,
+    "product_id": 32769,
+    "device_name": "Thingino Matter Camera",
+    "streamer_backend": "auto",
+    "enable_nightmode": true,
+    "enable_privacy": true,
+    "enable_motion": true
+  }
+}

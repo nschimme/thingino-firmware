@@ -1,0 +1,71 @@
+#!/bin/sh
+# shellcheck disable=SC1091,SC2034,SC2086,SC3043
+# matterctl - CLI for Thingino Matter 1.5 daemon
+
+FIFO="/run/matter/cmd.fifo"
+
+send_cmd() {
+	cmd="$1"
+	if [ ! -p "$FIFO" ]; then
+		echo "matterd is not running or FIFO not available" >&2
+		exit 1
+	fi
+	printf '%s\n' "$cmd" >"$FIFO"
+}
+
+get_config() {
+	jct /etc/thingino.json get "$1" 2>/dev/null
+}
+
+case "$1" in
+	status)
+		if pidof matterd >/dev/null 2>&1; then
+			echo "matterd is running (PID $(pidof matterd))"
+			disc=$(get_config "matter.discriminator")
+			pass=$(get_config "matter.passcode")
+			echo "Discriminator: ${disc:-3840}"
+			echo "Passcode: ${pass:-20202021}"
+		else
+			echo "matterd is stopped"
+		fi
+		;;
+	announce)
+		send_cmd "announce"
+		echo "Announced Matter 1.5 discovery via mDNS"
+		;;
+	nightmode)
+		if [ "$2" = "on" ] || [ "$2" = "off" ]; then
+			send_cmd "nightmode $2"
+		else
+			echo "Usage: matterctl nightmode {on|off}"
+			exit 1
+		fi
+		;;
+	privacy)
+		if [ "$2" = "on" ] || [ "$2" = "off" ]; then
+			send_cmd "privacy $2"
+		else
+			echo "Usage: matterctl privacy {on|off}"
+			exit 1
+		fi
+		;;
+	pairing-code)
+		disc=$(get_config "matter.discriminator")
+		pass=$(get_config "matter.passcode")
+		disc="${disc:-3840}"
+		pass="${pass:-20202021}"
+		# Simple 11-digit pairing code representation
+		disc_msb=$(((disc >> 8) & 15))
+		val1=$(((disc_msb << 14) | (pass & 16383)))
+		val2=$((pass >> 14))
+		part1=$(printf "%05d" $((val1 % 100000)))
+		part2=$(printf "%05d" $((val2 % 100000)))
+		echo "${part1}${part2}"
+		;;
+	*)
+		echo "Usage: $0 {status|announce|pairing-code|nightmode on|off|privacy on|off}"
+		exit 1
+		;;
+esac
+
+exit 0

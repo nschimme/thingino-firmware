@@ -1,0 +1,15 @@
+config BR2_PACKAGE_THINGINO_MATTER
+	bool "thingino-matter"
+	default n
+	depends on BR2_PACKAGE_THINGINO_JCT
+	depends on BR2_PACKAGE_THINGINO_AGENT
+	select BR2_PACKAGE_MBEDTLS if !BR2_PACKAGE_THINGINO_MBEDTLS && !BR2_PACKAGE_WOLFSSL
+	help
+	  Matter 1.5 camera service for Thingino firmware.
+	  Provides a lightweight pure C daemon (matterd) exposing the onboard
+	  camera feed via Matter 1.5 WebRTC transport provider cluster,
+	  along with camera controls and motion events for Home Assistant
+	  Matter integration.
+	  Supports Raptor and TIMPS streamer backends.
+
+	  https://github.com/themactep/thingino-firmware
