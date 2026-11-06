@@ -1309,7 +1309,8 @@ static void handle_matter_packet(const uint8_t *buf, ssize_t len, const struct s
 	const uint8_t *msg_data = buf + header_len;
 	size_t msg_data_len = len - header_len;
 
-	if (s->encrypted && msg_data_len > 16) {
+	/* Only attempt decryption if the packet itself has security flags set (sec_flags != 0) */
+	if ((sec_flags & 0x08) && s->encrypted && msg_data_len > 16) {
 		const uint8_t *tag = msg_data + (msg_data_len - 16);
 		size_t cipher_len = msg_data_len - 16;
 		int dret = decrypt_matter_payload(s->i2r_key, sec_flags, counter, source_node_id,
