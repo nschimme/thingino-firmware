@@ -4,20 +4,27 @@ Thingino includes native support for exposing cameras via the **Matter 1.5**
 specification, designed specifically for Home Assistant and Matter-compatible
 controllers.
 
-## Architecture
+## Architecture & UNIX Philosophy
 
 Following the UNIX philosophy of Thingino, `thingino-matter` is composed of:
 
 1. **`matterd` (Pure C Daemon)**:
-   - A lightweight background daemon (~22KB binary footprint) running directly
+   - A lightweight background daemon (~30KB binary footprint) running directly
      on the Ingenic SoC.
-   - **DNS-SD / mDNS Responder**: Advertises `_matterc._udp.local` (commissionable)
-     and `_matter._tcp.local` (operational) service records with Matter Camera
-     device type (`DT=0x51`).
-   - **Matter Protocol Listener**: Listens on UDP port 5540 for Matter Session
-     and Interaction Model messages.
+   - **Dual-Stack IPv6 / IPv4 UDP Listener**: Listens on port 5540 (`[::]:5540`)
+     and responds to Matter Session and Interaction Model messages.
+   - **Matter 1.5 DNS-SD / mDNS Responder**: Advertises `_matterc._udp.local`
+     (commissionable) and `_matter._tcp.local` (operational) service records
+     with mandatory Matter 1.5 Camera discovery keys (`VP`, `D`, `CM`, `DT=0x51`,
+     `DN`, `SII`, `SAI`, `T`, `CRI`) over IPv6 multicast (`ff02::fb`) and IPv4.
+   - **Framing & Matter TLV**: Implements Matter framing and Type-Length-Value
+     (TLV) encoding/decoding.
+   - **PASE & Session Cryptography**: Implements Password-Authenticated Session
+     Establishment (PASE) and session cryptography backed by `mbedTLS`.
    - **WebRTC Transport Provider Cluster (`0x0551`)**: Bridges SDP offer/answer
      signaling between the Matter controller and the camera's streamer backend.
+   - **Camera Settings Cluster (`0x0550`)**: Exposes night vision, privacy mode,
+     and motion detection attributes and commands.
 
 2. **Streamer WebRTC Signaling Bridge**:
    - **Raptor**: Connects directly to Raptor's native WebRTC/WHIP endpoint
@@ -37,7 +44,8 @@ Following the UNIX philosophy of Thingino, `thingino-matter` is composed of:
 1. In the Thingino Web UI, navigate to **Settings -> Matter**.
 2. Enable the Matter Camera Service.
 3. Note the **Manual Pairing Code** (e.g., `12345678901`).
-4. In **Home Assistant**:
+4. Ensure your Home Assistant host and camera have IPv6 connectivity enabled.
+5. In **Home Assistant**:
    - Go to **Settings -> Devices & Services -> Integrations**.
    - Click **Add Integration** and choose **Matter**.
    - When prompted, select **No, it's not on the network / Enter setup code**.
