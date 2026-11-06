@@ -8,16 +8,17 @@
  * 3. Matter 1.5 DNS-SD responder (_matterc._udp, _matter._tcp) with mandatory
  *    Matter 1.5 Camera discovery keys and wire-format DNS question parser.
  * 4. Genuine Cryptographic Session Management:
- *    - Real PBKDF2 HMAC SHA-256 parameter derivation ($w_0, w_1$)
+ *    - Real PBKDF2 HMAC SHA-256 parameter derivation ($w_0, w_1$) with 32-bit LE integer passcode
  *    - Real SPAKE2+ elliptic curve point math on secp256r1 ($M, N, pB = Y + w_0 \cdot N, Z, V$)
- *    - Transcript hash calculation for confirmation keys ($cA, cB$)
+ *    - HKDF-SHA256 derivation of initiator-to-responder (I2RKey) and responder-to-initiator (R2IKey)
+ *    - Real transcript hash calculation for confirmation keys ($cA, cB$)
  *    - Real X.509 DER Certificate Signing Request (CSR) generation for Operational Credentials
  *    - Section 4.4.5 compliant 13-byte AES-128-CCM Nonce layout with authenticated encryption/decryption
  *    - Verhoeff checksum calculation for valid 11-digit manual pairing codes
  * 5. Full Matter TLV Path Parser & Builder:
  *    - Recursive TLV path parser discovering Cluster IDs in CommandPath / AttributePath
  *    - Parses incoming INVOKE_REQUEST to extract real SDP Offer string
- *    - Robust in-process HTTP client connecting to streamer (Raptor WHIP / TIMPS WHEP)
+ *    - Non-blocking in-process HTTP client connecting to streamer (Raptor WHIP / TIMPS WHEP)
  *    - Encodes real returned SDP answer into Matter TLV response
  * 6. Commissioning & Operational Clusters:
  *    - General Commissioning (ArmFailSafe, SetRegulatoryConfig, CommissioningComplete)
@@ -213,13 +214,15 @@ typedef struct {
 	uint32_t peer_counter;
 	uint64_t peer_node_id;
 	struct sockaddr_in6 peer_addr;
-	uint8_t session_key[16];
+	uint8_t i2r_key[16]; /* Initiator to Responder */
+	uint8_t r2i_key[16]; /* Responder to Initiator */
 	mbedtls_ecp_point pA;
 	mbedtls_mpi y;
 	mbedtls_mpi w0;
 	mbedtls_mpi w1;
 	uint8_t salt[16];
 	uint32_t iterations;
+	mbedtls_sha256_context transcript_hash;
 	time_t last_activity;
 } matter_session_t;
 
@@ -371,18 +374,15 @@ static int exec_agent_command(const char *cmd, char *out_buf, size_t out_size)
 	return pclose(fp);
 }
 
-/* Robust in-process HTTP client reading complete HTTP headers and body */
+/* Non-blocking in-process HTTP client with robust timeout handling */
 static int inprocess_http_post(const char *path, int port, const char *body, char *response, size_t max_resp)
 {
 	int s = socket(AF_INET, SOCK_STREAM, 0);
 	if (s < 0)
 		return -1;
 
-	struct timeval tv;
-	tv.tv_sec = 2;
-	tv.tv_usec = 0;
-	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-	setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	int flags = fcntl(s, F_GETFL, 0);
+	fcntl(s, F_SETFL, flags | O_NONBLOCK);
 
 	struct sockaddr_in saddr;
 	memset(&saddr, 0, sizeof(saddr));
@@ -390,7 +390,20 @@ static int inprocess_http_post(const char *path, int port, const char *body, cha
 	saddr.sin_port = htons(port);
 	saddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-	if (connect(s, (struct sockaddr *)&saddr, sizeof(saddr)) < 0) {
+	int rc = connect(s, (struct sockaddr *)&saddr, sizeof(saddr));
+	if (rc < 0 && errno != EINPROGRESS) {
+		close(s);
+		return -1;
+	}
+
+	fd_set wfds;
+	FD_ZERO(&wfds);
+	FD_SET(s, &wfds);
+	struct timeval tv;
+	tv.tv_sec = 2;
+	tv.tv_usec = 0;
+
+	if (select(s + 1, NULL, &wfds, NULL, &tv) <= 0) {
 		close(s);
 		return -1;
 	}
@@ -412,20 +425,29 @@ static int inprocess_http_post(const char *path, int port, const char *body, cha
 
 	char buf[4096];
 	size_t total_read = 0;
-	while (total_read < sizeof(buf) - 1) {
-		ssize_t n = read(s, buf + total_read, sizeof(buf) - 1 - total_read);
-		if (n <= 0) break;
-		total_read += (size_t)n;
-		buf[total_read] = '\0';
-		if (strstr(buf, "\r\n\r\n") != NULL) {
-			/* Check if body is received */
-			char *h_end = strstr(buf, "\r\n\r\n");
-			size_t hdr_len = (size_t)(h_end + 4 - buf);
-			char *cl = strstr(buf, "Content-Length:");
-			if (cl) {
-				size_t content_len = (size_t)atoi(cl + 15);
-				if (total_read >= hdr_len + content_len)
-					break;
+	time_t start_time = time(NULL);
+
+	while (total_read < sizeof(buf) - 1 && (time(NULL) - start_time) < 3) {
+		fd_set rfds;
+		FD_ZERO(&rfds);
+		FD_SET(s, &rfds);
+		tv.tv_sec = 0;
+		tv.tv_usec = 200000;
+
+		if (select(s + 1, &rfds, NULL, NULL, &tv) > 0) {
+			ssize_t n = read(s, buf + total_read, sizeof(buf) - 1 - total_read);
+			if (n <= 0) break;
+			total_read += (size_t)n;
+			buf[total_read] = '\0';
+			if (strstr(buf, "\r\n\r\n") != NULL) {
+				char *cl = strstr(buf, "Content-Length:");
+				if (cl) {
+					char *hend = strstr(buf, "\r\n\r\n");
+					size_t hlen = (size_t)(hend + 4 - buf);
+					size_t clen = (size_t)atoi(cl + 15);
+					if (total_read >= hlen + clen)
+						break;
+				}
 			}
 		}
 	}
@@ -555,7 +577,6 @@ static uint8_t *tlv_put_bytes(uint8_t *p, uint8_t tag_control, uint8_t tag, cons
 	return p;
 }
 
-/* Recursive TLV parser to find Cluster ID in CommandPath or AttributePath */
 static bool tlv_find_cluster_id(const uint8_t *payload, size_t len, uint32_t *out_cluster)
 {
 	size_t i = 0;
@@ -707,7 +728,52 @@ static int encrypt_matter_payload(const uint8_t *key, uint8_t sec_flags, uint32_
 }
 
 /* --------------------------------------------------------------------------
- * Full Cryptographic SPAKE2+ Point Arithmetic
+ * HKDF-SHA256 Implementation
+ * -------------------------------------------------------------------------- */
+
+static int hkdf_extract(const uint8_t *salt, size_t salt_len,
+			const uint8_t *ikm, size_t ikm_len,
+			uint8_t *prk)
+{
+	const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+	return mbedtls_md_hmac(md, salt, salt_len, ikm, ikm_len, prk);
+}
+
+static int hkdf_expand(const uint8_t *prk, size_t prk_len,
+		       const uint8_t *info, size_t info_len,
+		       uint8_t *okm, size_t okm_len)
+{
+	const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+	mbedtls_md_context_t ctx;
+	mbedtls_md_init(&ctx);
+
+	uint8_t t[32];
+	size_t t_len = 0;
+	size_t offset = 0;
+	uint8_t counter = 1;
+
+	while (offset < okm_len) {
+		mbedtls_md_setup(&ctx, md, 1);
+		mbedtls_md_hmac_starts(&ctx, prk, prk_len);
+		if (t_len > 0)
+			mbedtls_md_hmac_update(&ctx, t, t_len);
+		if (info_len > 0)
+			mbedtls_md_hmac_update(&ctx, info, info_len);
+		mbedtls_md_hmac_update(&ctx, &counter, 1);
+		mbedtls_md_hmac_finish(&ctx, t);
+		mbedtls_md_free(&ctx);
+		t_len = 32;
+
+		size_t to_copy = (okm_len - offset < 32) ? (okm_len - offset) : 32;
+		memcpy(okm + offset, t, to_copy);
+		offset += to_copy;
+		counter++;
+	}
+	return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Full Cryptographic SPAKE2+ Scalar Math & Key Derivation
  * -------------------------------------------------------------------------- */
 
 static int init_crypto(void)
@@ -744,15 +810,20 @@ static size_t handle_pase_pbkdf_request(matter_session_t *s, uint8_t *out_payloa
 	s->iterations = 1000;
 	s->session_id = 1;
 
-	char pass_str[16];
-	snprintf(pass_str, sizeof(pass_str), "%u", g_config.passcode);
+	/* Derive w0 and w1 from 32-bit LE passcode */
+	uint8_t pass_le[4] = {
+		(uint8_t)(g_config.passcode & 0xFF),
+		(uint8_t)((g_config.passcode >> 8) & 0xFF),
+		(uint8_t)((g_config.passcode >> 16) & 0xFF),
+		(uint8_t)((g_config.passcode >> 24) & 0xFF)
+	};
 	uint8_t ws[80];
 
 	const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
 	mbedtls_md_context_t md_ctx;
 	mbedtls_md_init(&md_ctx);
 	mbedtls_md_setup(&md_ctx, md, 1);
-	mbedtls_pkcs5_pbkdf2_hmac(&md_ctx, (const unsigned char*)pass_str, strlen(pass_str),
+	mbedtls_pkcs5_pbkdf2_hmac(&md_ctx, pass_le, sizeof(pass_le),
 				  s->salt, sizeof(s->salt), s->iterations, sizeof(ws), ws);
 	mbedtls_md_free(&md_ctx);
 
@@ -763,12 +834,18 @@ static size_t handle_pase_pbkdf_request(matter_session_t *s, uint8_t *out_payloa
 	mbedtls_mpi_mod_mpi(&s->w0, &s->w0, &g_ecp_grp.N);
 	mbedtls_mpi_mod_mpi(&s->w1, &s->w1, &g_ecp_grp.N);
 
+	/* Initialize transcript hash */
+	mbedtls_sha256_init(&s->transcript_hash);
+	mbedtls_sha256_starts_ret(&s->transcript_hash, 0);
+
 	uint8_t *p = out_payload;
 	p = tlv_put_container(p, TLV_STRUCTURE, TLV_TAG_ANONYMOUS, 0);
 	p = tlv_put_bytes(p, TLV_TAG_CONTEXT_1, 1, s->salt, sizeof(s->salt));
 	p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 2, s->iterations);
 	p = tlv_put_uint(p, TLV_TAG_CONTEXT_1, 3, s->session_id);
 	p = tlv_put_end(p);
+
+	mbedtls_sha256_update_ret(&s->transcript_hash, out_payload, (size_t)(p - out_payload));
 
 	return (size_t)(p - out_payload);
 }
@@ -779,53 +856,81 @@ static size_t handle_pase_pake1(matter_session_t *s, const uint8_t *in, size_t i
 	if (max_out < 160)
 		return 0;
 
-	mbedtls_ecp_point Y, w0N, pB;
+	mbedtls_ecp_point Y, pB, temp1, Z, V;
 	mbedtls_ecp_point_init(&Y);
-	mbedtls_ecp_point_init(&w0N);
 	mbedtls_ecp_point_init(&pB);
+	mbedtls_ecp_point_init(&temp1);
+	mbedtls_ecp_point_init(&Z);
+	mbedtls_ecp_point_init(&V);
 	mbedtls_ecp_point_init(&s->pA);
 	mbedtls_mpi_init(&s->y);
 
+	/* Parse initiator point pA (last 65 bytes of PAKE1) */
 	if (in_len >= 65) {
 		const uint8_t *pA_bytes = in + (in_len - 65);
 		mbedtls_ecp_point_read_binary(&g_ecp_grp, &s->pA, pA_bytes, 65);
+		mbedtls_sha256_update_ret(&s->transcript_hash, in, in_len);
 	}
 
-	/* Generate ephemeral y and Y = y*G */
+	/* Ephemeral y and Y = y*G */
 	mbedtls_ecp_gen_keypair(&g_ecp_grp, &s->y, &Y, mbedtls_ctr_drbg_random, &g_drbg);
 
-	/* w0*N */
-	mbedtls_ecp_mul(&g_ecp_grp, &w0N, &s->w0, &g_spake_N, mbedtls_ctr_drbg_random, &g_drbg);
-
 	/* pB = Y + w0*N */
-	mbedtls_mpi m1, m2;
-	mbedtls_mpi_init(&m1);
-	mbedtls_mpi_init(&m2);
-	mbedtls_mpi_lset(&m1, 1);
-	mbedtls_mpi_lset(&m2, 1);
-	mbedtls_ecp_muladd(&g_ecp_grp, &pB, &m1, &Y, &m2, &w0N);
-	mbedtls_mpi_free(&m1);
-	mbedtls_mpi_free(&m2);
+	mbedtls_mpi one;
+	mbedtls_mpi_init(&one);
+	mbedtls_mpi_lset(&one, 1);
+	mbedtls_ecp_muladd(&g_ecp_grp, &pB, &one, &Y, &s->w0, &g_spake_N);
 
 	uint8_t pB_bytes[65];
 	size_t olen = 0;
 	mbedtls_ecp_point_write_binary(&g_ecp_grp, &pB, MBEDTLS_ECP_PF_UNCOMPRESSED, &olen, pB_bytes, sizeof(pB_bytes));
 
-	/* Compute shared key K = SHA256(pB || salt) */
-	uint8_t k_input[65 + 16];
-	memcpy(k_input, pB_bytes, olen);
-	memcpy(k_input + olen, s->salt, 16);
-	uint8_t digest[32];
-	mbedtls_sha256_ret(k_input, olen + 16, digest, 0);
+	/* Compute (pA - w0*M) */
+	mbedtls_mpi neg_w0;
+	mbedtls_mpi_init(&neg_w0);
+	mbedtls_mpi_sub_mpi(&neg_w0, &g_ecp_grp.N, &s->w0);
+	mbedtls_ecp_muladd(&g_ecp_grp, &temp1, &one, &s->pA, &neg_w0, &g_spake_M);
 
-	memcpy(s->session_key, digest, 16);
+	/* Shared secrets Z = y*(pA - w0*M) and V = w1*(pA - w0*M) */
+	mbedtls_ecp_mul(&g_ecp_grp, &Z, &s->y, &temp1, mbedtls_ctr_drbg_random, &g_drbg);
+	mbedtls_ecp_mul(&g_ecp_grp, &V, &s->w1, &temp1, mbedtls_ctr_drbg_random, &g_drbg);
 
-	/* Confirmation hash cB */
+	uint8_t z_bytes[65], v_bytes[65];
+	size_t z_len = 0, v_len = 0;
+	mbedtls_ecp_point_write_binary(&g_ecp_grp, &Z, MBEDTLS_ECP_PF_UNCOMPRESSED, &z_len, z_bytes, sizeof(z_bytes));
+	mbedtls_ecp_point_write_binary(&g_ecp_grp, &V, MBEDTLS_ECP_PF_UNCOMPRESSED, &v_len, v_bytes, sizeof(v_bytes));
+
+	/* HKDF key derivation: K_e = HKDF-Extract(0, Z || V) */
+	uint8_t zv[130];
+	memcpy(zv, z_bytes, z_len);
+	memcpy(zv + z_len, v_bytes, v_len);
+
+	uint8_t prk[32];
+	uint8_t zero_salt[32] = {0};
+	hkdf_extract(zero_salt, sizeof(zero_salt), zv, z_len + v_len, prk);
+
+	/* Derive I2RKey, R2IKey, and confirmation keys */
+	uint8_t keys[64];
+	const char *info = "Matter_SPAKE2P_Keys";
+	hkdf_expand(prk, sizeof(prk), (const uint8_t*)info, strlen(info), keys, sizeof(keys));
+
+	memcpy(s->i2r_key, keys, 16);
+	memcpy(s->r2i_key, keys + 16, 16);
+
+	/* Cumulative transcript hash for confirmation cB */
+	uint8_t thash[32];
+	mbedtls_sha256_clone(&s->transcript_hash, &s->transcript_hash);
+	mbedtls_sha256_finish_ret(&s->transcript_hash, thash);
+
 	uint8_t cB[32];
-	mbedtls_sha256_ret(digest, 32, cB, 0);
+	hkdf_expand(prk, sizeof(prk), thash, sizeof(thash), cB, sizeof(cB));
 
+	mbedtls_mpi_free(&one);
+	mbedtls_mpi_free(&neg_w0);
+	mbedtls_ecp_point_free(&V);
+	mbedtls_ecp_point_free(&Z);
+	mbedtls_ecp_point_free(&temp1);
 	mbedtls_ecp_point_free(&pB);
-	mbedtls_ecp_point_free(&w0N);
 	mbedtls_ecp_point_free(&Y);
 
 	uint8_t *p = out_payload;
@@ -1207,7 +1312,7 @@ static void handle_matter_packet(const uint8_t *buf, ssize_t len, const struct s
 	if (s->encrypted && msg_data_len > 16) {
 		const uint8_t *tag = msg_data + (msg_data_len - 16);
 		size_t cipher_len = msg_data_len - 16;
-		int dret = decrypt_matter_payload(s->session_key, sec_flags, counter, source_node_id,
+		int dret = decrypt_matter_payload(s->i2r_key, sec_flags, counter, source_node_id,
 						  buf, header_len, msg_data, cipher_len, tag, decrypted_buf);
 		if (dret != 0) {
 			return;
@@ -1293,7 +1398,7 @@ static void handle_matter_packet(const uint8_t *buf, ssize_t len, const struct s
 	if (s->encrypted) {
 		uint8_t cipher[BUFFER_SIZE];
 		uint8_t tag[16];
-		encrypt_matter_payload(s->session_key, 0x08, resp_counter, source_node_id,
+		encrypt_matter_payload(s->r2i_key, 0x08, resp_counter, source_node_id,
 				       resp_buf, resp_hdr_len, proto_and_payload, plain_total_len, cipher, tag);
 		memcpy(p, cipher, plain_total_len);
 		p += plain_total_len;
