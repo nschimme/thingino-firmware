@@ -4,40 +4,40 @@
 #
 ################################################################################
 
-THINGINO_MATTER_VERSION = 090d61185d81d33d5ec38e9781875e03f1b9afc2
-THINGINO_MATTER_SITE = https://github.com/esp-dev/matter-c/archive/$(THINGINO_MATTER_VERSION)
-THINGINO_MATTER_SOURCE = thingino-matter-$(THINGINO_MATTER_VERSION).tar.gz
-THINGINO_MATTER_LICENSE = Apache-2.0
-THINGINO_MATTER_LICENSE_FILES = LICENSE
+THINGINO_MATTER_SITE_METHOD = local
+THINGINO_MATTER_SITE = $(THINGINO_MATTER_PKGDIR)/files
+THINGINO_MATTER_LICENSE = MIT
 
-THINGINO_MATTER_DEPENDENCIES = thingino-core thingino-jct thingino-agent
+THINGINO_MATTER_DEPENDENCIES = thingino-core thingino-jct thingino-agent matter-c
 
 ifeq ($(BR2_PACKAGE_MBEDTLS),y)
 THINGINO_MATTER_DEPENDENCIES += mbedtls
+THINGINO_MATTER_LDFLAGS += -lmbedx509 -lmbedcrypto
 else ifeq ($(BR2_PACKAGE_THINGINO_MBEDTLS),y)
 THINGINO_MATTER_DEPENDENCIES += thingino-mbedtls
+THINGINO_MATTER_LDFLAGS += -lmbedx509 -lmbedcrypto
 endif
 
-# Build standalone pure C99 Matter node with system mbedTLS and disable warnings-as-errors
-THINGINO_MATTER_CONF_OPTS = \
-	-DCMAKE_BUILD_TYPE=Release \
-	-DCMAKE_C_FLAGS="-Wno-error=maybe-uninitialized -Wno-error" \
-	-DMATTER_BUILD_RUNTIME=ON
+THINGINO_MATTER_CFLAGS += -I$(THINGINO_MATTER_PKGDIR)/files \
+	-I$(STAGING_DIR)/usr/include/matter \
+	-I$(STAGING_DIR)/usr/include/matter/model
 
-# Post-install hook: install SysV init scripts, defaults, CLI, and WebUI plugin
+THINGINO_MATTER_LDFLAGS += -L$(STAGING_DIR)/usr/lib -lmatter -lmatter_runtime -lm
+
+define THINGINO_MATTER_BUILD_CMDS
+	$(TARGET_CC) $(TARGET_CFLAGS) $(THINGINO_MATTER_CFLAGS) \
+		-o $(@D)/matterd $(@D)/matter_camera_app.c $(@D)/matter_camera_cluster.c \
+		$(TARGET_LDFLAGS) $(THINGINO_MATTER_LDFLAGS)
+endef
+
 define THINGINO_MATTER_INSTALL_TARGET_CMDS
 	# Stage defaults for merge by thingino-core
 	$(INSTALL) -D -m 0644 $(THINGINO_MATTER_PKGDIR)/files/thingino-matter.json \
 		$(TARGET_DIR)/usr/share/thingino-defaults/50-matter.json
 
-	# Install matter-node binary as matterd
-	if [ -f $(@D)/build/matter-node ]; then \
-		$(INSTALL) -D -m 0755 $(@D)/build/matter-node \
-			$(TARGET_DIR)/usr/sbin/matterd; \
-	elif [ -f $(@D)/matter-node ]; then \
-		$(INSTALL) -D -m 0755 $(@D)/matter-node \
-			$(TARGET_DIR)/usr/sbin/matterd; \
-	fi
+	# Install matter camera daemon
+	$(INSTALL) -D -m 0755 $(@D)/matterd \
+		$(TARGET_DIR)/usr/sbin/matterd
 
 	# Install CLI helpers and init scripts
 	$(INSTALL) -D -m 0755 $(THINGINO_MATTER_PKGDIR)/files/matterctl \
@@ -60,4 +60,4 @@ define THINGINO_MATTER_INSTALL_TARGET_CMDS
 		$(TARGET_DIR)/var/www/x/json-config-matter.cgi
 endef
 
-$(eval $(cmake-package))
+$(eval $(generic-package))

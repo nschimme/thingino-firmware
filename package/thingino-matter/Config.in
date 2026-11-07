@@ -1,7 +1,7 @@
 config BR2_PACKAGE_THINGINO_MATTER
 	bool "thingino-matter"
 	default n
-	depends on BR2_PACKAGE_MBEDTLS || BR2_PACKAGE_THINGINO_MBEDTLS
+	depends on BR2_PACKAGE_MATTER_C
 	depends on BR2_PACKAGE_THINGINO_JCT
 	depends on BR2_PACKAGE_THINGINO_AGENT
 	help
@@ -14,5 +14,5 @@ config BR2_PACKAGE_THINGINO_MATTER
 
 	  https://github.com/themactep/thingino-firmware
 
-comment "thingino-matter needs mbedTLS"
-	depends on !BR2_PACKAGE_MBEDTLS && !BR2_PACKAGE_THINGINO_MBEDTLS
+comment "thingino-matter needs matter-c"
+	depends on !BR2_PACKAGE_MATTER_C
