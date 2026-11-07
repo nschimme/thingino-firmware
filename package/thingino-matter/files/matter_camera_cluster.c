@@ -112,6 +112,12 @@ static uint8_t read_webrtc_attr(void* ctx, const void* ref, const Matter_Cluster
     return 1;
 }
 
+static uint8_t validate_cmd(void* ctx, const void* ref, const Matter_Cluster_Request_T* req, const uint8_t* in, size_t in_len)
+{
+    (void)ctx; (void)ref; (void)req; (void)in; (void)in_len;
+    return 0; /* OK */
+}
+
 static Matter_Result_T webrtc_command_start(void* ctx, const void* ref, const Matter_Cluster_Request_T* req,
     const uint8_t* in, size_t in_len, Matter_Tlv_Writer_T* out, Matter_Im_Command_Result_T* res, uint64_t* token)
 {
@@ -147,7 +153,7 @@ Matter_Cluster_T matter_webrtc_cluster_new(const Matter_Camera_Port_T* port)
         .events = 0,
         .callbacks = {
             .ctx = ctx,
-            .version = NULL,
+            .version = cluster_version,
             .destroy = NULL
         }
     };
@@ -169,8 +175,9 @@ Matter_Cluster_T matter_webrtc_cluster_new(const Matter_Camera_Port_T* port)
     static const uint32_t cmd_id = 1;
     Matter_Command_Def_T cmd = {
         .id = cmd_id,
-        .access = { MATTER_IM_OPERATE, false },
+        .access = { .privilege = MATTER_IM_OPERATE, .timed = false },
         .ref = &cmd_id,
+        .validate = validate_cmd,
         .start = webrtc_command_start
     };
     matter_cluster_add_command(cl, &cmd);
