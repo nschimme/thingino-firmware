@@ -1,35 +1,9 @@
 #!/bin/sh
 # shellcheck disable=SC2018,SC2019,SC2034,SC2046,SC2068,SC2086,SC2231,SC3043
 # S96matter_discovery - Streamer profile configuration & discovery helper for Matter 1.5
-# Follows the same pattern as S96onvif_discovery
 
 MATTER_CONFIG=/etc/thingino.json
 PORTAL_MODE_FLAG="/run/portal_mode"
-
-raptor_conf_get() {
-	section="$1"
-	key="$2"
-	raptorctl config get "$section" "$key" 2>/dev/null
-}
-
-raptor_bool_default() {
-	section="$1"
-	key="$2"
-	default="$3"
-	val=$(raptor_conf_get "$section" "$key" | tr 'A-Z' 'a-z')
-	[ -n "$val" ] || val="$default"
-	case "$val" in
-		true | yes | 1 | on) echo "true" ;;
-		false | no | 0 | off) echo "false" ;;
-		*) echo "$default" ;;
-	esac
-}
-
-raptor_webrtc_port() {
-	port=$(raptor_conf_get webrtc http_port)
-	[ -n "$port" ] || port="8554"
-	echo "$port"
-}
 
 get_device_mac() {
 	mac=""
@@ -43,7 +17,7 @@ get_device_mac() {
 }
 
 start() {
-	echo -c 15 "Configuring Matter streamer profile"
+	echo "Configuring Matter streamer profile"
 
 	if [ -f "$PORTAL_MODE_FLAG" ]; then
 		exit 0

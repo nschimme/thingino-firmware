@@ -21,7 +21,7 @@ start_daemon() {
 	disc=$(read_config "matter.discriminator")
 	pass=$(read_config "matter.passcode")
 	port=$(read_config "matter.port")
-	backend=$(read_config "matter.stream_backend")
+	backend=$(read_config "matter.streamer_backend")
 
 	disc="${disc:-3840}"
 	pass="${pass:-20202021}"

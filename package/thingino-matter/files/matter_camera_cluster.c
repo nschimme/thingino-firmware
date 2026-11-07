@@ -59,10 +59,13 @@ static Matter_Result_T cluster_version(void* ctx, uint32_t* ver)
     return MATTER_OK;
 }
 
+static CameraClusterCtx* g_camera_ctx = NULL;
+
 Matter_Cluster_T matter_camera_settings_new(const Matter_Camera_Port_T* port)
 {
     CameraClusterCtx* ctx = calloc(1, sizeof(*ctx));
     if (!ctx) return NULL;
+    g_camera_ctx = ctx;
     if (port) ctx->port = *port;
     ctx->version = 1;
 
@@ -97,6 +100,33 @@ Matter_Cluster_T matter_camera_settings_new(const Matter_Camera_Port_T* port)
     }
     matter_cluster_seal(cl);
     return cl;
+}
+
+void matter_camera_settings_set_motion(Matter_Cluster_T cl, bool motion_detected)
+{
+    (void)cl;
+    if (g_camera_ctx) {
+        g_camera_ctx->motion = motion_detected;
+        g_camera_ctx->version++;
+    }
+}
+
+void matter_camera_settings_set_nightmode(Matter_Cluster_T cl, bool nightmode)
+{
+    (void)cl;
+    if (g_camera_ctx) {
+        g_camera_ctx->nightmode = nightmode;
+        g_camera_ctx->version++;
+    }
+}
+
+void matter_camera_settings_set_privacy(Matter_Cluster_T cl, bool privacy)
+{
+    (void)cl;
+    if (g_camera_ctx) {
+        g_camera_ctx->privacy = privacy;
+        g_camera_ctx->version++;
+    }
 }
 
 /* WebRTC Transport Provider Cluster (0x0551) */

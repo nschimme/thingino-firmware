@@ -40,9 +40,6 @@
 
 typedef struct {
     char backend[32];
-    bool nightmode;
-    bool privacy;
-    bool motion;
     bool running;
 
     /* Matter runtime handles */
@@ -141,7 +138,6 @@ static int camera_signaling_offer(void* user, const char* sdp_offer, char* sdp_a
 static int camera_set_nightmode(void* user, bool on)
 {
     (void)user;
-    g_app.nightmode = on;
     pid_t pid = fork();
     if (pid == 0) {
         execl("/bin/sh", "sh", "-c", on ? "daynight night >/dev/null 2>&1 || agentctl daynight night" : "daynight day >/dev/null 2>&1 || agentctl daynight day", NULL);
@@ -153,7 +149,6 @@ static int camera_set_nightmode(void* user, bool on)
 static int camera_set_privacy(void* user, bool on)
 {
     (void)user;
-    g_app.privacy = on;
     pid_t pid = fork();
     if (pid == 0) {
         execl("/bin/sh", "sh", "-c", on ? "privacy on >/dev/null 2>&1 || agentctl privacy on" : "privacy off >/dev/null 2>&1 || agentctl privacy off", NULL);
@@ -177,10 +172,10 @@ static void handle_ipc_command(const char *cmd)
         camera_set_privacy(NULL, false);
         if (g_app.server) matter_server_changed(g_app.server);
     } else if (strncmp(cmd, "event motion 1", 14) == 0) {
-        g_app.motion = true;
+        matter_camera_settings_set_motion(g_app.camera_cluster, true);
         if (g_app.server) matter_server_changed(g_app.server);
     } else if (strncmp(cmd, "event motion 0", 14) == 0) {
-        g_app.motion = false;
+        matter_camera_settings_set_motion(g_app.camera_cluster, false);
         if (g_app.server) matter_server_changed(g_app.server);
     } else if (strncmp(cmd, "announce", 8) == 0) {
         if (g_app.server) matter_server_changed(g_app.server);
@@ -373,6 +368,7 @@ int main(int argc, char **argv)
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
+    signal(SIGCHLD, SIG_IGN);
 
     mkdir("/run/matter", 0755);
     const char *fifo_path = "/run/matter/cmd.fifo";

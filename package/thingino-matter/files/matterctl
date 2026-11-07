@@ -63,13 +63,6 @@ case "$1" in
 		fi
 		;;
 	pairing-code)
-		if [ -f /run/matter/pairing_code ]; then
-			code=$(cat /run/matter/pairing_code 2>/dev/null)
-			if [ -n "$code" ]; then
-				echo "$code"
-				exit 0
-			fi
-		fi
 		disc=$(get_config "matter.discriminator")
 		pass=$(get_config "matter.passcode")
 		disc="${disc:-3840}"

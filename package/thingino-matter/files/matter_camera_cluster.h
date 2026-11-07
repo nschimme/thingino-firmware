@@ -18,4 +18,8 @@ typedef struct {
 Matter_Cluster_T matter_camera_settings_new(const Matter_Camera_Port_T* port);
 Matter_Cluster_T matter_webrtc_cluster_new(const Matter_Camera_Port_T* port);
 
+void matter_camera_settings_set_motion(Matter_Cluster_T cl, bool motion_detected);
+void matter_camera_settings_set_nightmode(Matter_Cluster_T cl, bool nightmode);
+void matter_camera_settings_set_privacy(Matter_Cluster_T cl, bool privacy);
+
 #endif
