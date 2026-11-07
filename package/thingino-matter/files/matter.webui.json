@@ -1,0 +1,23 @@
+{
+  "name": "matter",
+  "label": "Matter 1.5",
+  "apiVersion": 1,
+  "nav": [
+    {
+      "section": "ddSettings",
+      "position": "after:Home Assistant",
+      "items": [
+        {
+          "label": "Matter",
+          "href": "/config-matter.html"
+        }
+      ]
+    }
+  ],
+  "styles": [],
+  "featureFlags": {
+    "matter": true
+  },
+  "cgi": ["/x/json-config-matter.cgi"],
+  "pages": ["/config-matter.html"]
+}

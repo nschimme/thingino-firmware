@@ -1,0 +1,16 @@
+config BR2_PACKAGE_MATTER_C
+	bool "matter-c"
+	depends on BR2_PACKAGE_MBEDTLS || BR2_PACKAGE_THINGINO_MBEDTLS
+	help
+	  matter-c is an independent Matter 1.6 protocol stack written
+	  from scratch in pure C99. Portable, callback-driven architecture
+	  designed for embedded systems with mbedTLS.
+
+	  Provides core Matter protocols: PASE (SPAKE2+), CASE (SIGMA),
+	  Interaction Model, TLV encoding, and DNS-SD discovery.
+	  100% pure C with no C++ runtime dependencies.
+
+	  https://github.com/esp-dev/matter-c
+
+comment "matter-c needs mbedTLS"
+	depends on !BR2_PACKAGE_MBEDTLS && !BR2_PACKAGE_THINGINO_MBEDTLS

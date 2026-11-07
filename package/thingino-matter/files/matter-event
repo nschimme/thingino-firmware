@@ -1,0 +1,21 @@
+#!/bin/sh
+# shellcheck disable=SC1091,SC2034,SC2086,SC3043
+# matter-event - Asynchronous event notifier for thingino-matter
+
+FIFO="/run/matter/cmd.fifo"
+
+if [ $# -lt 2 ]; then
+	echo "Usage: $0 <event_type> <value>" >&2
+	echo "Example: $0 motion 1" >&2
+	echo "Example: $0 nightmode on" >&2
+	exit 1
+fi
+
+EVENT_TYPE="$1"
+VALUE="$2"
+
+if [ -p "$FIFO" ]; then
+	printf 'event %s %s\n' "$EVENT_TYPE" "$VALUE" >"$FIFO" 2>/dev/null || true
+fi
+
+exit 0
