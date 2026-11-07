@@ -2,6 +2,8 @@
 #
 # thingino-matter
 #
+# Pure C99 Matter 1.5 Camera Application for Thingino
+#
 ################################################################################
 
 THINGINO_MATTER_SITE_METHOD = local
@@ -20,9 +22,10 @@ endif
 
 THINGINO_MATTER_CFLAGS += -I$(THINGINO_MATTER_PKGDIR)/files \
 	-I$(STAGING_DIR)/usr/include/matter \
-	-I$(STAGING_DIR)/usr/include/matter/model
+	-I$(STAGING_DIR)/usr/include/matter/model \
+	-I$(STAGING_DIR)/usr/include/matter/host
 
-THINGINO_MATTER_LDFLAGS += -L$(STAGING_DIR)/usr/lib -lmatter -lmatter_runtime -lm
+THINGINO_MATTER_LDFLAGS += -L$(STAGING_DIR)/usr/lib -lmatter_host -lmatter_runtime -lmatter -lm -lpthread
 
 define THINGINO_MATTER_BUILD_CMDS
 	$(TARGET_CC) $(TARGET_CFLAGS) $(THINGINO_MATTER_CFLAGS) \
@@ -38,6 +41,11 @@ define THINGINO_MATTER_INSTALL_TARGET_CMDS
 	# Install matter camera daemon
 	$(INSTALL) -D -m 0755 $(@D)/matterd \
 		$(TARGET_DIR)/usr/sbin/matterd
+
+	# Install standard test attestation credentials for out-of-the-box pairing
+	mkdir -p $(TARGET_DIR)/etc/matter/credentials
+	$(INSTALL) -D -m 0644 $(THINGINO_MATTER_PKGDIR)/files/credentials/* \
+		$(TARGET_DIR)/etc/matter/credentials/
 
 	# Install CLI helpers and init scripts
 	$(INSTALL) -D -m 0755 $(THINGINO_MATTER_PKGDIR)/files/matterctl \

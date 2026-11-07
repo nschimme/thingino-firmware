@@ -18,10 +18,6 @@
   "featureFlags": {
     "matter": true
   },
-  "cgi": [
-    "/x/json-config-matter.cgi"
-  ],
-  "pages": [
-    "/config-matter.html"
-  ]
+  "cgi": ["/x/json-config-matter.cgi"],
+  "pages": ["/config-matter.html"]
 }

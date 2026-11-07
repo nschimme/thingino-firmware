@@ -17,7 +17,37 @@ read_config() {
 
 start_daemon() {
 	mkdir -p /run/matter
-	start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON"
+
+	disc=$(read_config "matter.discriminator")
+	pass=$(read_config "matter.passcode")
+	port=$(read_config "matter.port")
+	backend=$(read_config "matter.stream_backend")
+
+	disc="${disc:-3840}"
+	pass="${pass:-20202021}"
+	port="${port:-5540}"
+	backend="${backend:-auto}"
+
+	# Detect active IPv6 link-local interface
+	iface_idx=1
+	for iface in eth0 wlan0 usb0; do
+		if [ -d "/sys/class/net/$iface" ]; then
+			idx=$(cat "/sys/class/net/$iface/ifindex" 2>/dev/null)
+			if [ -n "$idx" ]; then
+				iface_idx="$idx"
+				break
+			fi
+		fi
+	done
+
+	start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- \
+		--interface "$iface_idx" \
+		--discriminator "$disc" \
+		--pin "$pass" \
+		--port "$port" \
+		--backend "$backend" \
+		--credentials /etc/matter/credentials \
+		--state /etc/matter/matter_state.bin
 }
 
 stop_daemon() {

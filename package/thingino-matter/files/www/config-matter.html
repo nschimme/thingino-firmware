@@ -1,92 +1,168 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Matter 1.5 Configuration - Thingino</title>
-</head>
-<body>
-  <div class="container my-3">
-    <div class="row">
-      <div class="col-12 col-lg-8">
-        <div class="card mb-3">
-          <div class="card-header d-flex justify-content-between align-items-center">
-            <h5 class="mb-0">Matter 1.5 Integration</h5>
-            <span id="matter-status-badge" class="badge bg-secondary">Unknown</span>
-          </div>
-          <div class="card-body">
-            <p class="text-muted">
-              Exposes Thingino as an official Matter 1.5 camera supporting WebRTC live streaming,
-              camera controls, and motion events directly to Matter controllers such as Home Assistant.
-            </p>
+  <head>
+    <meta charset="utf-8" />
+    <title>Matter 1.5 Configuration - Thingino</title>
+  </head>
+  <body>
+    <div class="container my-3">
+      <div class="row">
+        <div class="col-12 col-lg-8">
+          <div class="card mb-3">
+            <div
+              class="card-header d-flex justify-content-between align-items-center"
+            >
+              <h5 class="mb-0">Matter 1.5 Integration</h5>
+              <span id="matter-status-badge" class="badge bg-secondary"
+                >Unknown</span
+              >
+            </div>
+            <div class="card-body">
+              <p class="text-muted">
+                Exposes Thingino as an official Matter 1.5 camera supporting
+                WebRTC live streaming, camera controls, and motion events
+                directly to Matter controllers such as Home Assistant.
+              </p>
 
-            <form id="matter-form">
-              <div class="form-check form-switch mb-3">
-                <input class="form-check-input" type="checkbox" id="matter_enabled">
-                <label class="form-check-label" for="matter_enabled"><strong>Enable Matter Camera Service</strong></label>
-              </div>
+              <form id="matter-form">
+                <div class="form-check form-switch mb-3">
+                  <input
+                    class="form-check-input"
+                    type="checkbox"
+                    id="matter_enabled"
+                  />
+                  <label class="form-check-label" for="matter_enabled"
+                    ><strong>Enable Matter Camera Service</strong></label
+                  >
+                </div>
 
-              <div class="row g-3 mb-3">
-                <div class="col-md-6">
-                  <label for="matter_device_name" class="form-label">Device Name</label>
-                  <input type="text" class="form-control" id="matter_device_name" placeholder="Thingino Matter Camera">
+                <div class="row g-3 mb-3">
+                  <div class="col-md-6">
+                    <label for="matter_device_name" class="form-label"
+                      >Device Name</label
+                    >
+                    <input
+                      type="text"
+                      class="form-control"
+                      id="matter_device_name"
+                      placeholder="Thingino Matter Camera"
+                    />
+                  </div>
+                  <div class="col-md-6">
+                    <label for="matter_streamer_backend" class="form-label"
+                      >Streamer Backend</label
+                    >
+                    <select class="form-select" id="matter_streamer_backend">
+                      <option value="auto">Auto-detect (Raptor / TIMPS)</option>
+                      <option value="raptor">Raptor (WHIP/WHEP)</option>
+                      <option value="timps">TIMPS (WHEP)</option>
+                    </select>
+                  </div>
                 </div>
-                <div class="col-md-6">
-                  <label for="matter_streamer_backend" class="form-label">Streamer Backend</label>
-                  <select class="form-select" id="matter_streamer_backend">
-                    <option value="auto">Auto-detect (Raptor / TIMPS)</option>
-                    <option value="raptor">Raptor (WHIP/WHEP)</option>
-                    <option value="timps">TIMPS (WHEP)</option>
-                  </select>
-                </div>
-              </div>
 
-              <div class="row g-3 mb-3">
-                <div class="col-md-4">
-                  <label for="matter_port" class="form-label">Matter UDP Port</label>
-                  <input type="number" class="form-control" id="matter_port" value="5540">
+                <div class="row g-3 mb-3">
+                  <div class="col-md-4">
+                    <label for="matter_port" class="form-label"
+                      >Matter UDP Port</label
+                    >
+                    <input
+                      type="number"
+                      class="form-control"
+                      id="matter_port"
+                      value="5540"
+                    />
+                  </div>
+                  <div class="col-md-4">
+                    <label for="matter_discriminator" class="form-label"
+                      >Discriminator (0-4095)</label
+                    >
+                    <input
+                      type="number"
+                      class="form-control"
+                      id="matter_discriminator"
+                      value="3840"
+                    />
+                  </div>
+                  <div class="col-md-4">
+                    <label for="matter_passcode" class="form-label"
+                      >Setup Passcode</label
+                    >
+                    <input
+                      type="number"
+                      class="form-control"
+                      id="matter_passcode"
+                      value="20202021"
+                    />
+                  </div>
                 </div>
-                <div class="col-md-4">
-                  <label for="matter_discriminator" class="form-label">Discriminator (0-4095)</label>
-                  <input type="number" class="form-control" id="matter_discriminator" value="3840">
-                </div>
-                <div class="col-md-4">
-                  <label for="matter_passcode" class="form-label">Setup Passcode</label>
-                  <input type="number" class="form-control" id="matter_passcode" value="20202021">
-                </div>
-              </div>
 
-              <div class="card bg-light mb-3">
-                <div class="card-body">
-                  <h6 class="card-title">Pairing Credentials</h6>
-                  <p class="mb-1"><strong>Manual Pairing Code:</strong> <code id="matter_pairing_code">Loading...</code></p>
-                  <p class="mb-1"><strong>mDNS Discovery Subtype:</strong> <code>_matterc._udp.local</code></p>
-                  <p class="mb-0 text-muted small">Enter the manual pairing code into Home Assistant (Settings -> Devices & Services -> Add Integration -> Matter).</p>
+                <div class="card bg-light mb-3">
+                  <div class="card-body">
+                    <h6 class="card-title">Pairing Credentials</h6>
+                    <p class="mb-1">
+                      <strong>Manual Pairing Code:</strong>
+                      <code id="matter_pairing_code">Loading...</code>
+                    </p>
+                    <p class="mb-1">
+                      <strong>mDNS Discovery Subtype:</strong>
+                      <code>_matterc._udp.local</code>
+                    </p>
+                    <p class="mb-0 text-muted small">
+                      Enter the manual pairing code into Home Assistant
+                      (Settings -> Devices & Services -> Add Integration ->
+                      Matter).
+                    </p>
+                  </div>
                 </div>
-              </div>
 
-              <div class="mb-3">
-                <h6>Exposed Camera Features</h6>
-                <div class="form-check form-switch mb-1">
-                  <input class="form-check-input" type="checkbox" id="matter_enable_nightmode" checked>
-                  <label class="form-check-label" for="matter_enable_nightmode">Night Vision / IR Cut Control</label>
+                <div class="mb-3">
+                  <h6>Exposed Camera Features</h6>
+                  <div class="form-check form-switch mb-1">
+                    <input
+                      class="form-check-input"
+                      type="checkbox"
+                      id="matter_enable_nightmode"
+                      checked
+                    />
+                    <label
+                      class="form-check-label"
+                      for="matter_enable_nightmode"
+                      >Night Vision / IR Cut Control</label
+                    >
+                  </div>
+                  <div class="form-check form-switch mb-1">
+                    <input
+                      class="form-check-input"
+                      type="checkbox"
+                      id="matter_enable_privacy"
+                      checked
+                    />
+                    <label class="form-check-label" for="matter_enable_privacy"
+                      >Privacy Mode</label
+                    >
+                  </div>
+                  <div class="form-check form-switch mb-1">
+                    <input
+                      class="form-check-input"
+                      type="checkbox"
+                      id="matter_enable_motion"
+                      checked
+                    />
+                    <label class="form-check-label" for="matter_enable_motion"
+                      >Motion Detection Events</label
+                    >
+                  </div>
                 </div>
-                <div class="form-check form-switch mb-1">
-                  <input class="form-check-input" type="checkbox" id="matter_enable_privacy" checked>
-                  <label class="form-check-label" for="matter_enable_privacy">Privacy Mode</label>
-                </div>
-                <div class="form-check form-switch mb-1">
-                  <input class="form-check-input" type="checkbox" id="matter_enable_motion" checked>
-                  <label class="form-check-label" for="matter_enable_motion">Motion Detection Events</label>
-                </div>
-              </div>
 
-              <button type="submit" class="btn btn-primary" id="btn-save">Save Settings</button>
-            </form>
+                <button type="submit" class="btn btn-primary" id="btn-save">
+                  Save Settings
+                </button>
+              </form>
+            </div>
           </div>
         </div>
       </div>
     </div>
-  </div>
-  <script src="/a/config-matter.js"></script>
-</body>
+    <script src="/a/config-matter.js"></script>
+  </body>
 </html>

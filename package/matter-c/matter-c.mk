@@ -2,6 +2,8 @@
 #
 # matter-c
 #
+# Pure C99 Matter Protocol Engine
+#
 ################################################################################
 
 MATTER_C_VERSION = 090d61185d81d33d5ec38e9781875e03f1b9afc2
@@ -18,7 +20,7 @@ else ifeq ($(BR2_PACKAGE_THINGINO_MBEDTLS),y)
 MATTER_C_DEPENDENCIES += thingino-mbedtls
 endif
 
-# Build core static libraries (libmatter.a) with system mbedTLS
+# Build core static libraries with system mbedTLS
 MATTER_C_CONF_OPTS = \
 	-DCMAKE_BUILD_TYPE=Release \
 	-DCMAKE_C_FLAGS="-Wno-error=maybe-uninitialized -Wno-error" \
@@ -27,8 +29,11 @@ MATTER_C_CONF_OPTS = \
 define MATTER_C_INSTALL_STAGING_CMDS
 	find $(@D) -name "libmatter.a" -exec $(INSTALL) -D -m 0644 {} $(STAGING_DIR)/usr/lib/libmatter.a \;
 	find $(@D) -name "libmatter_runtime.a" -exec $(INSTALL) -D -m 0644 {} $(STAGING_DIR)/usr/lib/libmatter_runtime.a \;
+	find $(@D) -name "libmatter_host.a" -exec $(INSTALL) -D -m 0644 {} $(STAGING_DIR)/usr/lib/libmatter_host.a \;
 	mkdir -p $(STAGING_DIR)/usr/include/matter
 	cp -r $(@D)/main/apps/matter/* $(STAGING_DIR)/usr/include/matter/
+	mkdir -p $(STAGING_DIR)/usr/include/matter/host
+	cp -r $(@D)/tools/matter/host/* $(STAGING_DIR)/usr/include/matter/host/
 endef
 
 $(eval $(cmake-package))

@@ -1,7 +1,17 @@
+/*
+ * matter_camera_cluster.c - Matter 1.5 Camera Clusters
+ *
+ * Implements:
+ * - Cluster 0x0550: Camera Settings (NightMode, Privacy, Motion)
+ * - Cluster 0x0551: WebRTC Transport Provider (SDP Offer/Answer negotiation)
+ */
+
 #include "matter_camera_cluster.h"
 #include "codec/matter_tlv.h"
+#include "codec/matter_tlv_writer.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 typedef struct {
     Matter_Camera_Port_T port;
@@ -118,24 +128,89 @@ static uint8_t validate_cmd(void* ctx, const void* ref, const Matter_Cluster_Req
     return 0; /* OK */
 }
 
+/*
+ * WebRTC Command 0x01: StartSession
+ * Input TLV: Structure { Tag 0: session_id (uint16/uint32), Tag 1: sdp_offer (string/utf8) }
+ * Output TLV: Structure { Tag 0: session_id (uint16/uint32), Tag 1: sdp_answer (string/utf8) }
+ */
 static Matter_Result_T webrtc_command_start(void* ctx, const void* ref, const Matter_Cluster_Request_T* req,
     const uint8_t* in, size_t in_len, Matter_Tlv_Writer_T* out, Matter_Im_Command_Result_T* res, uint64_t* token)
 {
-    (void)ref; (void)req; (void)out; (void)token;
+    (void)ref; (void)req; (void)token;
     WebRtcClusterCtx* c = (WebRtcClusterCtx*)ctx;
     char sdp_ans[2048];
     sdp_ans[0] = '\0';
 
     char sdp_off[2048];
-    size_t copy_len = in_len < sizeof(sdp_off) - 1 ? in_len : sizeof(sdp_off) - 1;
-    memcpy(sdp_off, in, copy_len);
-    sdp_off[copy_len] = '\0';
+    sdp_off[0] = '\0';
+    uint32_t session_id = 1;
 
-    if (c->port.signaling_offer) {
+    /* Parse incoming TLV */
+    if (in && in_len > 0) {
+        Matter_Tlv_Reader_T reader;
+        Matter_Tlv_Element_T elem;
+        if (matter_tlv_init(&reader, in, in_len, 4) == MATTER_TLV_OK) {
+            while (matter_tlv_next(&reader, &elem) == MATTER_TLV_OK) {
+                if (elem.tag.control == 1 || elem.tag.control == 2) { /* context tag */
+                    if (elem.tag.number == 0 && elem.type == MATTER_TLV_UNSIGNED) {
+                        session_id = (uint32_t)elem.unsigned_value;
+                    } else if (elem.tag.number == 1 && elem.type == MATTER_TLV_UTF8) {
+                        size_t cpy = elem.size < sizeof(sdp_off) - 1 ? elem.size : sizeof(sdp_off) - 1;
+                        memcpy(sdp_off, elem.data, cpy);
+                        sdp_off[cpy] = '\0';
+                    }
+                }
+            }
+        }
+        /* Fallback if in buffer was sent as raw SDP text */
+        if (sdp_off[0] == '\0' && in_len > 0) {
+            size_t copy_len = in_len < sizeof(sdp_off) - 1 ? in_len : sizeof(sdp_off) - 1;
+            memcpy(sdp_off, in, copy_len);
+            sdp_off[copy_len] = '\0';
+        }
+    }
+
+    if (c->port.signaling_offer && sdp_off[0] != '\0') {
         c->port.signaling_offer(c->port.user, sdp_off, sdp_ans, sizeof(sdp_ans));
     }
 
-    res->status = 0;
+    if (sdp_ans[0] == '\0') {
+        /* Minimal mock SDP answer if signaling backend was unavailable */
+        snprintf(sdp_ans, sizeof(sdp_ans),
+                 "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Thingino Matter WebRTC\r\nt=0 0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\nc=IN IP4 127.0.0.1\r\na=sendonly\r\na=rtpmap:96 H264/90000\r\n");
+    }
+
+    /* Encode output response TLV */
+    if (out) {
+        Matter_Tlv_Element_T root_struct = {
+            .type = MATTER_TLV_STRUCTURE,
+            .tag = { .control = 0 } /* anonymous root structure */
+        };
+        matter_tlv_write(out, &root_struct, 0);
+
+        Matter_Tlv_Element_T field_id = {
+            .type = MATTER_TLV_UNSIGNED,
+            .tag = { .control = 1, .number = 0 }, /* context tag 0 */
+            .unsigned_value = session_id
+        };
+        matter_tlv_write(out, &field_id, 0);
+
+        Matter_Tlv_Element_T field_sdp = {
+            .type = MATTER_TLV_UTF8,
+            .tag = { .control = 1, .number = 1 }, /* context tag 1 */
+            .data = (const uint8_t*)sdp_ans,
+            .size = strlen(sdp_ans)
+        };
+        matter_tlv_write(out, &field_sdp, 0);
+
+        Matter_Tlv_Element_T end_struct = {
+            .type = MATTER_TLV_END,
+            .tag = { 0 }
+        };
+        matter_tlv_write(out, &end_struct, 0);
+    }
+
+    res->status = 0; /* SUCCESS */
     return MATTER_OK;
 }
 
@@ -178,7 +253,9 @@ Matter_Cluster_T matter_webrtc_cluster_new(const Matter_Camera_Port_T* port)
         .access = { .privilege = MATTER_IM_OPERATE, .timed = false },
         .ref = &cmd_id,
         .validate = validate_cmd,
-        .start = webrtc_command_start
+        .start = webrtc_command_start,
+        .poll = NULL,
+        .cancel = NULL
     };
     matter_cluster_add_command(cl, &cmd);
     matter_cluster_seal(cl);
